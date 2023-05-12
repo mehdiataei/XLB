@@ -1,7 +1,11 @@
+import time
 import jax.numpy as jnp
 from jax import jit
 from functools import partial
+from multiprocessing import Pool
+from tqdm import tqdm
 import numpy as np
+import pyvista as pv
 class BoundaryCondition(object):
     """
     Base class for boundary conditions in a LBM simulation.
@@ -28,8 +32,8 @@ class BoundaryCondition(object):
         Whether the boundary condition is for a solid boundary. This should be set in subclasses.
     isDynamic : bool
         Whether the boundary condition is dynamic (changes over time). This should be set in subclasses.
-    needsExtraConfiguration : bool
-        Whether the boundary condition requires extra configuration. This should be set in subclasses.
+    indicesNeedsExtraConfiguration : bool
+        Whether the boundary condition indices requires extra configuration. This should be set in subclasses.
     implementationStep : str
         The step in the lattice Boltzmann method algorithm at which the boundary condition is applied. This should be set in subclasses.
     """
@@ -45,7 +49,7 @@ class BoundaryCondition(object):
         self.name = None
         self.isSolid = False
         self.isDynamic = False
-        self.needsExtraConfiguration = False
+        self.indicesNeedsExtraConfiguration = False
         self.implementationStep = "PostStreaming"
 
     def create_local_bitmask_and_normal_arrays(self, connectivity_bitmask):
@@ -67,9 +71,9 @@ class BoundaryCondition(object):
         This method creates local bitmask and normal arrays for the boundary condition based on the connectivity bitmask.
         If the boundary condition requires extra configuration, the `configure` method is called.
         """
-        if self.needsExtraConfiguration:
-            self.configure(connectivity_bitmask)
-            self.needsExtraConfiguration = False
+        if self.indicesNeedsExtraConfiguration:
+            self.configure_indices(connectivity_bitmask)
+            self.indicesNeedsExtraConfiguration = False
 
         boundaryBitmask = connectivity_bitmask[self.indices]
         self.normals = self.get_normals(boundaryBitmask)
@@ -78,7 +82,7 @@ class BoundaryCondition(object):
 
         return
 
-    def configure(self, connectivity_bitmask):
+    def configure_indices(self, connectivity_bitmask):
         """
         Configures the boundary condition.
 
@@ -96,6 +100,24 @@ class BoundaryCondition(object):
         This method should be overridden in subclasses if the boundary condition requires extra configuration.
         """
         return
+    
+    def create_boundary_auxiliary_data(self):
+        """
+        Creates auxillary data for the boundary condition.
+
+        Parameters
+        ----------
+        None
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        This method should be overridden in subclasses if the boundary condition requires auxillary data such as interpolation weights.
+        """
+        pass
 
     @partial(jit, static_argnums=(0, 3), inline=True)
     def prepare_populations(self, fout, fin, implementation_step):
@@ -433,7 +455,7 @@ class BounceBackHalfway(BoundaryCondition):
     implementationStep : str
         The step in the lattice Boltzmann method algorithm at which the boundary condition is applied. For this class,
         it is "PostStreaming".
-    needsExtraConfiguration : bool
+    indicesNeedsExtraConfiguration : bool
         Whether the boundary condition needs extra configuration before it can be applied. For this class, it is True.
     isSolid : bool
         Whether the boundary condition represents a solid boundary. For this class, it is True.
@@ -442,10 +464,10 @@ class BounceBackHalfway(BoundaryCondition):
         super().__init__(indices, grid_info, precision_policy)
         self.name = "BounceBackHalfway"
         self.implementationStep = "PostStreaming"
-        self.needsExtraConfiguration = True
+        self.indicesNeedsExtraConfiguration = True
         self.isSolid = True
 
-    def configure(self, connectivity_bitmask):
+    def configure_indices(self, connectivity_bitmask):
         """
         Configures the boundary condition.
 
@@ -636,9 +658,9 @@ class ZouHe(BoundaryCondition):
         self.implementationStep = "PostStreaming"
         self.type = type
         self.prescribed = prescribed
-        self.needsExtraConfiguration = True
+        self.indicesNeedsExtraConfiguration = True
 
-    def configure(self, connectivity_bitmask):
+    def configure_indices(self, connectivity_bitmask):
         """
         Correct boundary indices to ensure that only voxelized surfaces with normal vectors along main cartesian axes
         are assigned this type of BC.
@@ -766,7 +788,7 @@ class Regularized(ZouHe):
         super().__init__(indices, grid_info, precision_policy, type, prescribed)
         self.name = "Regularized"
         #TODO for Hesam: check to understand why corner cases cause instability here.
-        # self.needsExtraConfiguration = False
+        # self.indicesNeedsExtraConfiguration = False
         self.construct_symmetric_lattice_moment()
 
     def construct_symmetric_lattice_moment(self):
@@ -890,10 +912,10 @@ class ExtrapolationOutflow(BoundaryCondition):
     def __init__(self, indices, grid_info, precision_policy):
         super().__init__(indices, grid_info, precision_policy)
         self.name = "ExtrapolationOutflow"
-        self.needsExtraConfiguration = True
+        self.indicesNeedsExtraConfiguration = True
         self.sound_speed = 1./jnp.sqrt(3.)
 
-    def configure(self, connectivity_bitmask):
+    def configure_indices(self, connectivity_bitmask):
         """
         Configure the boundary condition by finding neighbouring voxel indices.
 
@@ -976,3 +998,169 @@ class ExtrapolationOutflow(BoundaryCondition):
         fbd = fout[self.indices]
         fbd = fbd.at[bindex, self.imissing].set(fin[self.indices][bindex, self.iknown])
         return fbd
+
+class InterpolatedBounceBack(BoundaryCondition):
+    """
+    Interpolated bounce-back boundary condition for a lattice Boltzmann method simulation.
+
+    Attributes
+    ----------
+    name : str
+        The name of the boundary condition. For this class, it is "InterpolatedBounceBack".
+    implementationStep : str
+        The step in the lattice Boltzmann method algorithm at which the boundary condition is applied. For this class,
+        it is "PostStreaming".
+    indicesNeedsExtraConfiguration : bool
+        Whether the boundary condition needs extra configuration before it can be applied. For this class, it is True.
+    isSolid : bool
+        Whether the boundary condition represents a solid boundary. For this class, it is True.
+    """
+    def __init__(self, indices, mesh, grid_info, precision_policy):
+        # This BC is only valid for 3D lattices
+        assert grid_info['dim'] == 3, "Interpolated bounce-back boundary condition is only valid for 3D lattices."
+        super().__init__(indices, grid_info, precision_policy)
+        self.name = "InterpolatedBounceBack"
+        self.implementationStep = "PostStreaming"
+        self.indicesNeedsExtraConfiguration = True
+        self.isSolid = True
+        self.mesh = mesh
+        
+    def create_boundary_auxiliary_data(self):
+        """
+        Creates the interpolation data needed for the boundary condition.
+
+        The function wraps the existing mesh for processing with pyvista. It calculates the interpolation 
+        weights, which represent the distances from the start points to the end points of rays traced through the mesh.
+        The weights are initially set to infinity corresponding to infinite distances.
+        
+        The function uses multiprocessing to speed up the calculation of these distances.
+
+        Returns
+        -------
+        None. The function updates the object's weights attribute in place.
+        """
+        # Wrap the mesh with pyvista for processing
+        mesh = pv.wrap(self.mesh)
+        
+        # Transpose indices for easier handling
+        indices = np.array(self.indices).T
+        
+        # Remove zeroth direction
+        imissingBitmask = np.array(self.imissingBitmask)[:, 1:] 
+        c = np.array(self.lattice.c)[:, 1:]
+        
+        # Calculate distances using multiprocessing for efficiency
+        print("Finding interpolation weights...")
+        start = time.time()
+        with Pool() as p:
+            results = list(p.starmap(calculate_distance, 
+                                    [(i, mesh, indices, c, imissingBitmask) 
+                                    for i in range(indices.shape[0])]))
+        end = time.time()
+        print(f"Time to find interpolation weights: {end - start} seconds")
+
+        # Unpack results
+        distances, rays, _ = zip(*results)
+        
+        # Initialize weights with infinities
+        self.weights = np.full((len(self.indices[0]), self.lattice.q), np.inf)
+        
+        # Update weights where rays are present, accounting for the removed zeroth direction
+        for i, ray in enumerate(rays):
+            self.weights[i, ray + 1] = distances[i]
+
+        return
+
+    def configure_indices(self, connectivity_bitmask):
+        """
+        Configures the boundary condition.
+
+        Parameters
+        ----------
+        connectivity_bitmask : array-like
+            The connectivity bitmask for the lattice.
+
+        Returns
+        -------
+        None
+
+        Notes
+        -----
+        This method performs an index shift for the halfway bounce-back boundary condition. It updates the indices of
+        the boundary nodes to be the indices of fluid nodes adjacent of the solid nodes.
+        """
+        # Perform index shift for BB.
+        boundaryBitmask = connectivity_bitmask[self.indices]
+        shiftDir = ~boundaryBitmask[:, self.lattice.opp_indices]
+        idx = np.array(self.indices).T
+        idx_trg = []
+        for i in range(self.lattice.q):
+            idx_trg.append(idx[shiftDir[:, i], :] + self.lattice.c[:, i])
+        indices_new = np.unique(np.vstack(idx_trg), axis=0)
+        self.indices = tuple(indices_new.T)
+        return
+
+    @partial(jit, static_argnums=(0,))
+    def apply(self, fout, fin):
+        """
+        Applies the halfway bounce-back boundary condition.
+
+        Parameters
+        ----------
+        fout : jax.numpy.ndarray
+            The output distribution functions.
+        fin : jax.numpy.ndarray
+            The input distribution functions.
+
+        Returns
+        -------
+        jax.numpy.ndarray
+            The modified output distribution functions after applying the boundary condition.
+        """
+        nbd = len(self.indices[0])
+        bindex = np.arange(nbd)[:, None]
+        fbd = fout[self.indices]
+        fbd = fbd.at[bindex, self.imissing].set(fin[self.indices][bindex, self.iknown])
+
+        return fbd
+    
+
+
+def calculate_distance(i, mesh, indices, c, imissingBitmask):
+    """
+    Function to calculate the distance between start points and end points of rays.
+
+    Parameters
+    ----------
+    i : int
+        index for the current calculation
+    mesh : trimesh or PyVista mesh types
+        PyVista wrapped mesh for ray tracing
+    indices : np.array
+        transposed indices of the directions
+    c: np.array
+        directional array with zeroth direction removed
+        imissingBitmask: mask array with zeroth direction removed
+
+    Returns
+    -------
+    distances : tuple
+        distances between start points and end points of rays
+    rays : tuple
+        ray paths
+    cells : tuple
+        cells that rays pass through
+    """
+    # Get the directions for the current index by accessing the missing bitmask
+    directions = -c[..., imissingBitmask[i]].T
+    
+    # Create starting points for each direction
+    start_points_i = np.stack([indices[i]] * directions.shape[0], axis=0)
+    
+    # Perform multi-ray tracing
+    points, rays, cells = mesh.multi_ray_trace(start_points_i, directions, first_point=True)
+    
+    # Calculate distances between start points and traced points
+    distances = np.linalg.norm(points - start_points_i[0], axis=-1)
+    
+    return distances, rays, cells

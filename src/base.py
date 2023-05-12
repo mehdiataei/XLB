@@ -140,6 +140,7 @@ class LBMBase(object):
         for bc in self.BCs:
             assert bc.implementationStep in ['PostStreaming', 'PostCollision']
             bc.create_local_bitmask_and_normal_arrays(connectivity_bitmask)
+            bc.create_boundary_auxiliary_data()
         print("Time to create the local bitmasks and normal arrays:", time.time() - start)
 
     # This is another non-JITed way of creating the distributed arrays. It is not used at the moment.
