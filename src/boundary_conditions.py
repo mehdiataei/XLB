@@ -1015,7 +1015,7 @@ class InterpolatedBounceBack(BoundaryCondition):
     isSolid : bool
         Whether the boundary condition represents a solid boundary. For this class, it is True.
     """
-    def __init__(self, indices, mesh, grid_info, precision_policy):
+    def __init__(self, indices, implicit_distances, grid_info, precision_policy):
         # This BC is only valid for 3D lattices
         assert grid_info['dim'] == 3, "Interpolated bounce-back boundary condition is only valid for 3D lattices."
         super().__init__(indices, grid_info, precision_policy)
@@ -1023,52 +1023,27 @@ class InterpolatedBounceBack(BoundaryCondition):
         self.implementationStep = "PostStreaming"
         self.indicesNeedsExtraConfiguration = True
         self.isSolid = True
-        self.mesh = mesh
+        self.implicit_distances = implicit_distances
         
     def create_boundary_auxiliary_data(self):
         """
         Creates the interpolation data needed for the boundary condition.
 
-        The function wraps the existing mesh for processing with pyvista. It calculates the interpolation 
-        weights, which represent the distances from the start points to the end points of rays traced through the mesh.
-        The weights are initially set to infinity corresponding to infinite distances.
-        
-        The function uses multiprocessing to speed up the calculation of these distances.
-
         Returns
         -------
         None. The function updates the object's weights attribute in place.
         """
-        # Wrap the mesh with pyvista for processing
-        mesh = pv.wrap(self.mesh)
-        
-        # Transpose indices for easier handling
-        indices = np.array(self.indices).T
-        
-        # Remove zeroth direction
-        imissingBitmask = np.array(self.imissingBitmask)[:, 1:] 
-        c = np.array(self.lattice.c)[:, 1:]
-        
-        # Calculate distances using multiprocessing for efficiency
-        print("Finding interpolation weights...")
-        start = time.time()
-        with Pool() as p:
-            results = list(p.starmap(calculate_distance, 
-                                    [(i, mesh, indices, c, imissingBitmask) 
-                                    for i in range(indices.shape[0])]))
-        end = time.time()
-        print(f"Time to find interpolation weights: {end - start} seconds")
+        idx = np.array(self.indices).T
+        self.weights = np.full((idx.shape[0], self.lattice.q), 0.5)
+        c = np.array(self.lattice.c)
+        sdf_f = self.implicit_distances[self.indices] 
 
-        # Unpack results
-        distances, rays, _ = zip(*results)
-        
-        # Initialize weights with infinities
-        self.weights = np.full((len(self.indices[0]), self.lattice.q), np.inf)
-        
-        # Update weights where rays are present, accounting for the removed zeroth direction
-        for i, ray in enumerate(rays):
-            self.weights[i, ray + 1] = distances[i]
-
+        for q in range(self.lattice.q):
+            solid_indices = idx + c[:, q]
+            solid_indices_tuple = tuple(map(tuple, solid_indices.T))
+            sdf_s = self.implicit_distances[solid_indices_tuple]
+            mask = self.iknownBitmask[:, q]
+            self.weights[mask, q] = sdf_f[mask] / (sdf_f[mask] - sdf_s[mask])
         return
 
     def configure_indices(self, connectivity_bitmask):
@@ -1097,6 +1072,7 @@ class InterpolatedBounceBack(BoundaryCondition):
         for i in range(self.lattice.q):
             idx_trg.append(idx[shiftDir[:, i], :] + self.lattice.c[:, i])
         indices_new = np.unique(np.vstack(idx_trg), axis=0)
+        self.solidIndices = self.indices
         self.indices = tuple(indices_new.T)
         return
 
@@ -1120,47 +1096,10 @@ class InterpolatedBounceBack(BoundaryCondition):
         nbd = len(self.indices[0])
         bindex = np.arange(nbd)[:, None]
         fbd = fout[self.indices]
-        fbd = fbd.at[bindex, self.imissing].set(fin[self.indices][bindex, self.iknown])
+        f_postcollision_iknown = fin[self.indices][bindex, self.iknown]
+        f_postcollision_imissing = fin[self.indices][bindex, self.imissing]
+        f_poststreaming_iknown = fout[self.indices][bindex, self.iknown]
+        fbd = fbd.at[bindex, self.imissing].set((1. - self.weights) * f_postcollision_iknown + self.weights \
+                                                 * (f_postcollision_imissing + f_poststreaming_iknown) / (1.0 + self.weights))
 
         return fbd
-    
-
-
-def calculate_distance(i, mesh, indices, c, imissingBitmask):
-    """
-    Function to calculate the distance between start points and end points of rays.
-
-    Parameters
-    ----------
-    i : int
-        index for the current calculation
-    mesh : trimesh or PyVista mesh types
-        PyVista wrapped mesh for ray tracing
-    indices : np.array
-        transposed indices of the directions
-    c: np.array
-        directional array with zeroth direction removed
-        imissingBitmask: mask array with zeroth direction removed
-
-    Returns
-    -------
-    distances : tuple
-        distances between start points and end points of rays
-    rays : tuple
-        ray paths
-    cells : tuple
-        cells that rays pass through
-    """
-    # Get the directions for the current index by accessing the missing bitmask
-    directions = -c[..., imissingBitmask[i]].T
-    
-    # Create starting points for each direction
-    start_points_i = np.stack([indices[i]] * directions.shape[0], axis=0)
-    
-    # Perform multi-ray tracing
-    points, rays, cells = mesh.multi_ray_trace(start_points_i, directions, first_point=True)
-    
-    # Calculate distances between start points and traced points
-    distances = np.linalg.norm(points - start_points_i[0], axis=-1)
-    
-    return distances, rays, cells

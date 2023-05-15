@@ -1,5 +1,5 @@
 from time import time
-import trimesh
+import pyvista as pv
 from src.boundary_conditions import *
 from jax.config import config
 from src.utils import *
@@ -21,32 +21,37 @@ precision = 'f32/f32'
 
 class Sphere(BGKSim):
 
-    def voxelize(self, length_lbm_unit):
-        mesh = trimesh.creation.icosphere(radius=1)
-        length_phys_unit = mesh.extents.max()
-        pitch = length_phys_unit/length_lbm_unit
-        mesh_voxelized = mesh.voxelized(pitch=pitch)
-        mesh_matrix = mesh_voxelized.matrix
-        return mesh_matrix, pitch, mesh
-
     def set_boundary_conditions(self):
         print('Voxelizing mesh...')
-        time_start = time()
-        voxelized, pitch, mesh = self.voxelize(self.nx / 4)
-        # Translate and scale the mesh such that it has positive coordinates and scale it with the inverse of the pitch
-        mesh.apply_scale(1.0 / pitch)
-        mesh.apply_translation(-mesh.bounds[0])
-        
-        print('Voxelization time for pitch={}: {} seconds'.format(pitch, time() - time_start))
-        print("Voxelized shape: ", voxelized.shape)
 
-        self.sphere_area = np.prod(voxelized.shape[1:])
-        tx, ty, tz = np.array([nx, ny, nz]) - voxelized.shape
-        shift = [tx // 4, ty // 2, tz // 2]
-        mesh.apply_translation(shift)
-        sphere_indices = np.argwhere(voxelized) + shift
-        self.BCs.append(InterpolatedBounceBack(tuple(sphere_indices.T), mesh, self.grid_info, self.precision_policy))
+        # mesh = pv.read('examples/DrivAer-Notchback.stl')
+        radius = 0.5
+        mesh = pv.Sphere(radius=radius, center=(0, 0, 0))
+        # mesh = mesh.decimate(0.99)
+        pitch = (self.nx / 4) / mesh.length
+        mesh = mesh.scale(pitch)
+        self.sphere_projected_area = radius**2 * np.pi
+        mesh_center = np.array(mesh.center)
 
+        # Move mesh using mesh.bounds such that the center of the mesh is at the center of the domain nx/2, ny/2, nz/2
+        mesh = mesh.translate(-mesh_center + np.array([self.nx/3, self.ny/2, self.nz/2]))
+        # mesh = mesh.translate([0, 0, -mesh.bounds[4]])
+
+        grid = pv.UniformGrid(dimensions=[self.nx, self.nz, self.nz])
+
+        time_start = time()    
+
+        grid.compute_implicit_distance(mesh, inplace=True)
+
+        voxelized = grid.image_threshold((-1, 1), in_value=True, out_value=False, preference='cell')
+        voxelized = np.array(voxelized.get_array('implicit_distance'), dtype=np.bool_).reshape((self.nx, self.ny, self.nz), order='F')
+        voxel_indices = voxelized.nonzero()
+        print('Voxelization took {:07.6f} seconds'.format(time() - time_start))
+        print('Number of mesh boundary voxels: ', voxel_indices[0].shape[0])
+
+        implicit_distances = np.array(grid.get_array('implicit_distance'), dtype=self.precision_policy.compute_dtype).reshape((self.nx, self.ny, self.nz), order='F')
+
+        self.BCs.append(InterpolatedBounceBack(voxel_indices, implicit_distances, self.grid_info, self.precision_policy))
 
         wall = np.concatenate((self.boundingBoxIndices['bottom'], self.boundingBoxIndices['top'],
                                self.boundingBoxIndices['front'], self.boundingBoxIndices['back']))
@@ -75,8 +80,8 @@ class Sphere(BGKSim):
         boundary_force = np.sum(boundary_force, axis=0)
         drag = np.sqrt(boundary_force[0]**2 + boundary_force[1]**2)     #xy-plane
         lift = boundary_force[2]                                        #z-direction
-        cd = 2. * drag / (u_inlet ** 2 * self.sphere_area)
-        cl = 2. * lift / (u_inlet ** 2 * self.sphere_area)
+        cd = 2. * drag / (u_inlet ** 2 * self.sphere_projected_area)
+        cl = 2. * lift / (u_inlet ** 2 * self.sphere_projected_area)
 
         u_old = np.linalg.norm(u_prev, axis=2)
         u_new = np.linalg.norm(u, axis=2)
