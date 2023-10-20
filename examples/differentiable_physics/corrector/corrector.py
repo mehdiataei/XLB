@@ -38,11 +38,11 @@ class Corrector(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = x.reshape(-1)
-        x = self._dense_relu(x, 64)
         x = self._dense_relu(x, 256)
-        x = self._dense_relu(x, 512)
-        x = self._dense_relu(x, 256)
+        x = self._dense_relu(x, 128)
         x = self._dense_relu(x, 64)
+        x = self._dense_relu(x, 128)
+        x = self._dense_relu(x, 256)
         x = nn.Dense(features=64*64*9)(x)
         return x.reshape((64, 64, 9))
 
@@ -65,26 +65,32 @@ def prepare_simulation_parameters(precision, prescribed_velocity, nx, ny, Re):
         'nz': 0,
         'precision': precision
     }
-def train_model(corrector, optimizer, initial_params, optimizer_state, simulation_low, simulation_high, epochs=100):
+def train_model(corrector, optimizer, initial_params, optimizer_state, simulation_low, simulation_high, epochs=5):
     params = initial_params
-    f_high = simulation_high.run(1000)
+    f_high = simulation_high.run(2 * 3000)
     f_high_downsampled = downsample_field(f_high, 2)
-         
+
+    f_low = simulation_low.assign_fields_sharded()
+    f_low = simulation_low.run(3000)
+    target_error = jnp.mean((f_low[1:-1, 1:-1, ...] - f_high_downsampled[1:-1, 1:-1, ...]) ** 2 / jnp.var(f_high_downsampled))
+
     for epoch in range(epochs):
         params, optimizer_state, loss = update(params, optimizer, optimizer_state, f_high_downsampled, simulation_low, corrector)
         
         print(f"Epoch {epoch + 1}, Loss: {loss}")
-    
+        print("Target error to beat: ", target_error)
+
     return params
 
 def update(params, optimizer, optimizer_state, f_high_downsampled, simulation_low, corrector):
     loss, grad = jax.value_and_grad(loss_fn)(params, f_high_downsampled, simulation_low, corrector)
+
     updates, optimizer_state = optimizer.update(grad, optimizer_state)
     new_params = optax.apply_updates(params, updates)
     return new_params, optimizer_state, loss
 
 def loss_fn(params, f_high_downsampled, simulation_low, corrector):
-    max_timestep = 1000
+    max_timestep = 3000
     application_steps = 200
     f_low = simulation_low.assign_fields_sharded()
     
@@ -93,7 +99,7 @@ def loss_fn(params, f_high_downsampled, simulation_low, corrector):
         f, _ = simulation_low.step(f, timestep)
         return (f, timestep + 1), None
     for i in range(max_timestep // application_steps):
-        factor = 0.01
+        factor = 0.005
         f_low, _ = lax.scan(scan_fn, (f_low, application_steps * i), jnp.arange(application_steps))
         f_low = f_low[0]
         f_low = f_low.at[1:-1, 1:-1, ...].add(factor * corrector.apply(params, f_low[1:-1, 1:-1, ...]))
@@ -101,8 +107,8 @@ def loss_fn(params, f_high_downsampled, simulation_low, corrector):
     variance = jnp.var(f_high_downsampled)
     return jnp.mean((f_low[1:-1, 1:-1, ...] - f_high_downsampled[1:-1, 1:-1, ...]) ** 2 / variance)
 
-def visualize_error(corrector, trained_params, simulation_low, simulation_high, max_timestep=1000, application_steps=200):
-    f_high = simulation_high.run(max_timestep)
+def visualize_error(corrector, trained_params, simulation_low, simulation_high, max_timestep=4000, application_steps=200):
+    f_high = simulation_high.run(2 * max_timestep)
     f_high_downsampled = downsample_field(f_high, 2)
     f_low = simulation_low.assign_fields_sharded()
     
@@ -112,7 +118,7 @@ def visualize_error(corrector, trained_params, simulation_low, simulation_high, 
         return (f, timestep + 1), None
     for i in range(max_timestep // application_steps):
         f_low, _ = lax.scan(scan_fn, (f_low, application_steps * i), jnp.arange(application_steps))
-        factor = 0.01
+        factor = 0.005
         f_low = f_low[0]
         f_low = f_low.at[1:-1, 1:-1, ...].add(factor * corrector.apply(trained_params, f_low[1:-1, 1:-1, ...]))
 
@@ -133,45 +139,53 @@ def visualize_error(corrector, trained_params, simulation_low, simulation_high, 
 
     max_velocity = np.max([u_low_magnitude.max(), u_low_without_corrector_magnitude.max(), u_high_magnitude.max()])
     min_velocity = np.min([u_low_magnitude.min(), u_low_without_corrector_magnitude.min(), u_high_magnitude.min()])
+    
+    # Figure for errors
+    fig_error = plt.figure(figsize=(10, 5))
+    ax1 = fig_error.add_subplot(1, 2, 1)
+    im1 = ax1.imshow(error_with_corrector.T, cmap="jet", origin='lower', vmin=min_error, vmax=max_error)
+    ax1.set_title("Error low-res with corrector")
+    plt.colorbar(im1, ax=ax1)
+    
+    ax2 = fig_error.add_subplot(1, 2, 2)
+    im2 = ax2.imshow(error_without_corrector.T, cmap="jet", origin='lower', vmin=min_error, vmax=max_error)
+    ax2.set_title("Error low-res without corrector")
+    plt.colorbar(im2, ax=ax2)
 
-    fig = plt.figure(figsize=(16, 10))
-    gs = GridSpec(2, 3, figure=fig, wspace=0.5)
+    fig_error.savefig("error.png", dpi=600)
 
-    ax0 = fig.add_subplot(gs[:, 1])
+    np.save('u_low_magnitude.npy', u_low_magnitude)
+    np.save('u_low_without_corrector_magnitude.npy', u_low_without_corrector_magnitude)
+    np.save('u_high_magnitude.npy', u_high_magnitude)
+    np.save('error_with_corrector.npy', error_with_corrector)
+    np.save('error_without_corrector.npy', error_without_corrector)
 
+    # Figure for u_magnitude
+    fig_u_magnitude = plt.figure(figsize=(16, 6))
+    
+    ax0 = fig_u_magnitude.add_subplot(1, 3, 1)
     im0 = ax0.imshow(u_high_magnitude.T, cmap="jet", origin='lower', vmin=min_velocity, vmax=max_velocity)
     ax0.set_title("Reference (high-res)")
-    cbar_ax = fig.add_axes([0.63, 0.25, 0.015, 0.5])  # [left, bottom, width, height]
-    plt.colorbar(im0, cax=cbar_ax)
+    plt.colorbar(im0, ax=ax0)
 
-    ax1 = fig.add_subplot(gs[0, 0])
+    ax1 = fig_u_magnitude.add_subplot(1, 3, 2)
     im1 = ax1.imshow(u_low_magnitude.T, cmap="jet", origin='lower', vmin=min_velocity, vmax=max_velocity)
     ax1.set_title("Low-res with corrector")
     plt.colorbar(im1, ax=ax1)
 
-    ax2 = fig.add_subplot(gs[1, 0])
+    ax2 = fig_u_magnitude.add_subplot(1, 3, 3)
     im2 = ax2.imshow(u_low_without_corrector_magnitude.T, cmap="jet", origin='lower', vmin=min_velocity, vmax=max_velocity)
     ax2.set_title("Low-res without corrector")
     plt.colorbar(im2, ax=ax2)
 
-    ax3 = fig.add_subplot(gs[0, 2])
-    im3 = ax3.imshow(error_with_corrector.T, cmap="jet", origin='lower', vmin=min_error, vmax=max_error)
-    ax3.set_title("Error low-res with corrector")
-    plt.colorbar(im3, ax=ax3)
-
-    ax4 = fig.add_subplot(gs[1, 2])
-    im4 = ax4.imshow(error_without_corrector.T, cmap="jet", origin='lower', vmin=min_error, vmax=max_error)
-    ax4.set_title("Error low-res without corrector")
-    plt.colorbar(im4, ax=ax4)
-    
-    plt.savefig("error.png", dpi=600)
+    fig_u_magnitude.savefig("u_magnitude.png", dpi=600)
 
 def main():
     os.system("rm -rf ./*.vtk && rm -rf ./*.png")
     
     precision = "f32/f32"
-    prescribed_velocity = 0.1
-    Re = 10000.0
+    prescribed_velocity = 0.05
+    Re = 1000.0
     
     params_low = prepare_simulation_parameters(precision, prescribed_velocity, 66, 66, Re)
     params_high = prepare_simulation_parameters(precision, prescribed_velocity, 132, 132, Re)
