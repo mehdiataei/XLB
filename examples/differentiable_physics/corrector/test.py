@@ -1,34 +1,38 @@
+import flax.linen as nn
 import jax
-from flax import linen as nn
 import jax.numpy as jnp
 
-
-class UNet(nn.Module):
+class ResidualBlock(nn.Module):
+    filters: int
+    kernel_size: int = 5
+    
     @nn.compact
     def __call__(self, x):
-        # Encoder
-        x1 = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding="SAME")(x)
-        x1 = nn.relu(x1)
-        x2 = nn.Conv(features=128, kernel_size=(3, 3), strides=(2, 2), padding="SAME")(x1)
-        x2 = nn.relu(x2)
+        residual = x
+        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size))(x)
+        x = nn.leaky_relu(x)
+        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size))(x)
+        return nn.leaky_relu(x + residual)
 
-        # Decoder
-        x3 = nn.ConvTranspose(features=64, kernel_size=(3, 3), strides=(2, 2), padding="SAME")(x2)
-        x3 = nn.relu(x3)
-        x3 = nn.Conv(features=9, kernel_size=(3, 3), strides=(1, 1), padding="SAME")(x3)
+class ResNet(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        # Initial Conv layer
+        x = nn.Conv(32, kernel_size=(5, 5))(x)
+        x = nn.leaky_relu(x)
+
+        # Residual Blocks
+        x = ResidualBlock(32)(x)
+        x = ResidualBlock(32)(x)
+
+        # Output layer
+        x = nn.Conv(9, kernel_size=(5, 5))(x)
         
-        x4 = nn.ConvTranspose(features=9, kernel_size=(3, 3), strides=(2, 2), padding="SAME")(x3)
-    
-        return x4
+        return x
 
-    
-
-    # Initialize the model and parameters
-model = UNet()
-params = model.init(jax.random.PRNGKey(0), jnp.ones((64, 64, 9)))
-
-# Forward pass
-output = model.apply(params, jnp.ones((64, 64, 9)))
-
-# The output shape should be (128, 128, 9)
-print(output.shape)
+# Test the model
+x = jnp.ones((64, 64, 2))  # Removed the batch dimension
+model = ResNet()
+params = model.init(jax.random.PRNGKey(0), x)
+y = model.apply(params, x)
+print(y.shape)  # Should be (64, 64, 9)

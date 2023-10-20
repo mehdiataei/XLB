@@ -63,10 +63,10 @@ if __name__ == "__main__":
     precision = "f32/f32"
     lattice = LatticeD2Q9(precision)
 
-    nx = 200
-    ny = 200
+    nx = 400
+    ny = 400
 
-    Re = 200.0
+    Re = 1000.0
     prescribed_vel = 0.1
     clength = nx - 1
 
@@ -93,4 +93,4 @@ if __name__ == "__main__":
     }
 
     sim = Cavity(**kwargs)
-    sim.run(5000)
+    sim.run(2000)

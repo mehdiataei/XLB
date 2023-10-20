@@ -3,6 +3,7 @@
 .idea/
 
 # Outputs
+*npy
 *vti
 *vtr
 *vtk
