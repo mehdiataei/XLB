@@ -27,9 +27,9 @@ class SimulationParameters:
     unrolling_steps: int = 4
     training_steps: int = 100
     test_steps: int = 500
-    epochs: int = 400
-    correction_factor: float = 1e-6
-    learning_rate: float = 1e-3
+    epochs: int = 300
+    correction_factor: float = 1e-2
+    learning_rate: float = 1e-4
     load_from_checkpoint: bool = False
 
 config = SimulationParameters()
@@ -104,25 +104,25 @@ class ResidualBlock(nn.Module):
     def __call__(self, x):
         residual = x
         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-                    kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.ones_init())(x)
+                    kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
         x = nn.relu(x)
         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-                    kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.ones_init())(x)
+                    kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
         return nn.relu(x + residual)
 
 class Corrector(nn.Module):
-    layers: int = 5
+    layers: int = 8
     @nn.compact
     def __call__(self, x):
         # Initial Conv layer
-        x = nn.Conv(32, kernel_size=(5, 5))(x)
+        x = nn.Conv(64, kernel_size=(5, 5))(x)
         x = nn.relu(x)
 
         # Residual Blocks
         for _ in range(self.layers):
-            x = ResidualBlock(32)(x)
+            x = ResidualBlock(64)(x)
         # Output layer
-        x = nn.Conv(9, kernel_size=(5, 5))(x)
+        x = nn.Conv(3, kernel_size=(5, 5))(x)
         
         return x
 
@@ -183,13 +183,16 @@ def loss_fn(params, simulation_lr, simulation_hr, f_lr, f_hr, corrector):
     error = 0
     for i in range(config.unrolling_steps):
         f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, i)
-        u_lr = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
-        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, ...].add(config.correction_factor *
-                                                                 corrector.apply(params, u_lr))
+        rho_lr, u_lr = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])
+        nn_input = jnp.concatenate((u_lr, rho_lr), axis=-1)
+        corrections = config.correction_factor * corrector.apply(params, nn_input)
+        rho_cr = rho_lr - corrections[..., 0][..., None]
+        u_cr = u_lr - corrections[..., 1:]
+        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, :].add(simulation_lr.equilibrium(rho_cr, u_cr))
     
         f_hr, _ = simulation_hr.step(f_hr, i)
         f_hr, _ = simulation_hr.step(f_hr, i)
-        f_hr_downsampled = downsample_field(f_hr, 2, method='bilinear')
+        f_hr_downsampled = downsample_field(f_hr, 2, method='bicubic')
         
         u_hr = simulation_hr.update_macroscopic(f_hr_downsampled[1:-1, 1:-1, :])[1]
         u_lr_corrected = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
@@ -207,9 +210,13 @@ def test_error(corrector, params, simulation_lr, simulation_hr):
 
     for timestep in range(config.test_steps):
         f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, timestep)
-        u = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
-        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, ...].add(config.correction_factor *
-                                                                 corrector.apply(params, u))
+        rho_lr, u_lr = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])
+        nn_input = jnp.concatenate((u_lr, rho_lr), axis=-1)
+        corrections = config.correction_factor * corrector.apply(params, nn_input)
+        rho_cr = rho_lr - corrections[..., 0][..., None]
+        u_cr = u_lr - corrections[..., 1:]
+        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, :].add(simulation_lr.equilibrium(rho_cr, u_cr))
+    
 
         f_lr, _ = simulation_lr.step(f_lr, timestep)
 
@@ -217,7 +224,7 @@ def test_error(corrector, params, simulation_lr, simulation_hr):
         f_hr, _ = simulation_hr.step(f_hr, timestep)
         f_hr, _ = simulation_hr.step(f_hr, timestep)
 
-        f_hr_downsampled = downsample_field(f_hr, 2, method='bilinear')
+        f_hr_downsampled = downsample_field(f_hr, 2, method='bicubic')
 
         u_lr_corrected = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
         u_lr = simulation_lr.update_macroscopic(f_lr[1:-1, 1:-1, :])[1]
@@ -308,7 +315,7 @@ def main():
     simulation_hr = Cavity(**params_hr)
     corrector = Corrector()
 
-    initial_params = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr - 2, config.ny_lr - 2, 2))) # "- 2" since we only apply corrector to the inner domain
+    initial_params = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr - 2, config.ny_lr - 2, 3))) # "- 2" since we only apply corrector to the inner domain
 
     # Load from checkpoint if the flag is set
     if config.load_from_checkpoint:
