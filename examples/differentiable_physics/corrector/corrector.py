@@ -1,9 +1,12 @@
 import os
 import optax
 import jax
+from jax import jit
+from functools import partial
 import numpy as np
 import jax.lax as lax
 import jax.numpy as jnp
+from jax import vmap
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
@@ -19,23 +22,26 @@ from src.utils import downsample_field
 class SimulationParameters:
     nx_lr: int = 66
     ny_lr: int = 66
-    nx_hr: int = 132
-    ny_hr: int = 132
+    scaling_factor: int = 6
+    nx_hr: int = nx_lr * scaling_factor
+    ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: float = 400.0
-    unrolling_steps: int = 4
-    training_steps: int = 100
-    test_steps: int = 500
-    epochs: int = 400
-    correction_factor: float = 1e-6
-    learning_rate: float = 1e-3
+    Re: float = 100.0
+    unrolling_steps: int = 5
+    training_steps: int = 1000
+    test_steps: int = 1200
+    epochs: int = 100
+    correction_factor: float = 1.e-3
+    learning_rate: float = 1e-2
     load_from_checkpoint: bool = False
+    number_of_batches: int = 10
 
 config = SimulationParameters()
 class Cavity(BGKSim):
-    def __init__(self, **kwargs):
+    def __init__(self, corrector=None, **kwargs):
         self.prescribed_velocity = kwargs.pop("prescribed_velocity")
+        self.corrector = corrector
         super().__init__(**kwargs)
 
     def set_boundary_conditions(self):
@@ -51,25 +57,63 @@ class Cavity(BGKSim):
         vel_wall = np.zeros(moving_wall.shape, dtype=self.precisionPolicy.compute_dtype)
         vel_wall[:, 0] = self.prescribed_velocity
         self.BCs.append(EquilibriumBC(tuple(moving_wall.T), self.gridInfo, self.precisionPolicy, rho_wall, vel_wall))
+
+    @partial(jit, static_argnums=(0,), donate_argnums=(1,))
+    def collision(self, f, params=None):
+        f = self.precisionPolicy.cast_to_compute(f)
+        rho, u = self.compute_macroscopic(f)
+        feq = self.equilibrium(rho, u, cast_output=False)
+        fneq = f - feq
+        fout = f - self.omega * fneq
+        if params is not None:
+            force = config.correction_factor * self.corrector.apply(params, u)
+            fout = self.apply_force(force, fout, feq, rho, u)
+
+        return self.precisionPolicy.cast_to_output(fout)
+    
+
+    @partial(jit, static_argnums=(0, 4))
+    def step(self, f_poststreaming, timestep, params=None, return_fpost=False):
+        f_postcollision = self.collision(f_poststreaming, params)
+        f_postcollision = self.apply_bc(f_postcollision, f_poststreaming, timestep, "PostCollision")
+        f_poststreaming = self.streaming(f_postcollision)
+        f_poststreaming = self.apply_bc(f_poststreaming, f_postcollision, timestep, "PostStreaming")
+
+        if return_fpost:
+            return f_poststreaming, f_postcollision
+        else:
+            return f_poststreaming, None
         
+    @partial(jit, static_argnums=(0,))
+    def step_vmapped(self, f_poststreaming, timestep, params=None, return_fpost=False):
+        # vmap using the step function
+        step_vmap = vmap(self.step, in_axes=(0, None, None, None))
+        f_poststreaming, f_postcollision = step_vmap(f_poststreaming, timestep, params, return_fpost)
+        
+        return f_poststreaming, f_postcollision
+    
+    @partial(jit, static_argnums=(0,))
+    def compute_macroscopic_vmapped(self, f):
+        # vmap using the step function
+        rho, u = vmap(self.compute_macroscopic, in_axes=(0))(f)
+        return rho, u
 
-# class Corrector(nn.Module):
-#     @nn.compact
-#     def __call__(self, x):
-#         x = x.reshape(-1)
-#         # x = self._dense_relu(x, 512)
-#         x = self._dense_relu(x, 64)
-#         x = self._dense_relu(x, 64)
-#         x = self._dense_relu(x, 64)
-#         x = self._dense_relu(x, 64)
-#         x = self._dense_relu(x, 64)
-#         # x = self._dense_relu(x, 512)
-#         x = nn.Dense(features=64*64*9, use_bias=True)(x)
-#         return x.reshape((64, 64, 9))
+class Corrector(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        dim = x.shape[0]
+        x = x.reshape(-1)
+        x = self._dense_relu(x, 64)
+        x = self._dense_relu(x, 128)
+        x = self._dense_relu(x, 256)
+        x = self._dense_relu(x, 128)
+        x = self._dense_relu(x, 64)
+        x = nn.Dense(features=dim*dim*2, use_bias=True)(x)
+        return x.reshape((dim, dim, 2))
 
-#     def _dense_relu(self, x, features):
-#         x = nn.Dense(features=features, bias_init=nn.initializers.ones_init())(x)
-#         return nn.leaky_relu(x)
+    def _dense_relu(self, x, features):
+        x = nn.Dense(features=features, bias_init=nn.initializers.ones_init())(x)
+        return nn.relu(x)
 
 # class Corrector(nn.Module):
 #     def setup(self):
@@ -96,35 +140,35 @@ class Cavity(BGKSim):
 
 #         return x
 
-class ResidualBlock(nn.Module):
-    filters: int
-    kernel_size: int = 5
+# class ResidualBlock(nn.Module):
+#     filters: int
+#     kernel_size: int = 3
     
-    @nn.compact
-    def __call__(self, x):
-        residual = x
-        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-                    kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.ones_init())(x)
-        x = nn.relu(x)
-        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-                    kernel_init=nn.initializers.zeros_init(), bias_init=nn.initializers.ones_init())(x)
-        return nn.relu(x + residual)
+#     @nn.compact
+#     def __call__(self, x):
+#         residual = x
+#         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
+#                     kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
+#         x = nn.relu(x)
+#         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
+#                     kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
+#         return nn.relu(x + residual)
 
-class Corrector(nn.Module):
-    layers: int = 5
-    @nn.compact
-    def __call__(self, x):
-        # Initial Conv layer
-        x = nn.Conv(32, kernel_size=(5, 5))(x)
-        x = nn.relu(x)
+# class Corrector(nn.Module):
+#     layers: int = 18
+#     @nn.compact
+#     def __call__(self, x):
+#         # Initial Conv layer
+#         x = nn.Conv(32, kernel_size=(5, 5))(x)
+#         x = nn.relu(x)
 
-        # Residual Blocks
-        for _ in range(self.layers):
-            x = ResidualBlock(32)(x)
-        # Output layer
-        x = nn.Conv(9, kernel_size=(5, 5))(x)
+#         # Residual Blocks
+#         for _ in range(self.layers):
+#             x = ResidualBlock(32)(x)
+#         # Output layer
+#         x = nn.Conv(2, kernel_size=(5, 5))(x)
         
-        return x
+#         return x
 
 def prepare_simulation_parameters(nx, ny):
     lattice = LatticeD2Q9(config.precision)
@@ -142,59 +186,98 @@ def prepare_simulation_parameters(nx, ny):
         'precision': config.precision
     }
 
+class Dataset(object):
+    def __init__(self, simulation_lr, simulation_hr):
+        self.simulation_lr_data = None
+        self.simulation_hr_data = None
+        self.generate_data(simulation_lr, simulation_hr)
 
-def train_model(corrector, optimizer, initial_params, optimizer_state, simulation_lr, simulation_hr):
+    def generate_data(self, simulation_lr, simulation_hr):
+        
+        f_lr = simulation_lr.assign_fields_sharded()
+        f_hr = simulation_hr.assign_fields_sharded()
+        
+        lr_data_list = []
+        hr_data_list = []
+
+        print("Generating low-resolution data...")
+        for step in range(config.training_steps):
+            f_lr, _ = simulation_hr.step(f_lr, step)
+
+            lr_data_list.append(f_lr.copy())
+
+        print("Generating high-resolution data...")
+        for step in range(config.training_steps + config.unrolling_steps):
+            for i in range(config.scaling_factor):
+                f_hr, _ = simulation_hr.step(f_hr, step + i)
+            
+            f_hr_downsampled = downsample_field(f_hr, config.scaling_factor, method='bicubic')
+            hr_data_list.append(f_hr_downsampled)
+
+        self.simulation_lr_data = np.array(lr_data_list)
+        self.simulation_hr_data = np.array(hr_data_list)
+
+    def get_lr_data(self, step, batch_size):
+        if step >= self.simulation_lr_data.shape[0]:
+            raise ValueError("Data not available for the given step")
+
+        end_step = step + batch_size
+        if end_step > self.simulation_lr_data.shape[0]:
+            raise ValueError("Window size exceeds available data length")
+
+        return self.simulation_lr_data[step:end_step]
+
+    def get_hr_data(self, step, batch_size):
+        if step >= self.simulation_hr_data.shape[0]:
+            raise ValueError("Data not available for the given step")
+
+        end_step = step + batch_size
+        if end_step > self.simulation_hr_data.shape[0]:
+            raise ValueError("Window size exceeds available data length")
+
+        return self.simulation_hr_data[step:end_step]
+
+def train_model(optimizer, dataset, initial_params, optimizer_state, simulation_lr, simulation_hr):
     params = initial_params
     for epoch in range(config.epochs):
         total_loss = 0
-        f_lr = simulation_lr.assign_fields_sharded()
-        f_hr = simulation_hr.assign_fields_sharded()
-        for step in range(config.training_steps):
-            params, optimizer_state, loss, f_lr, f_hr = update(params, optimizer, optimizer_state, simulation_lr, simulation_hr, f_lr, f_hr, corrector)
+
+        for batch_id in range(config.number_of_batches):
+            params, optimizer_state, loss = update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr, simulation_hr)
             total_loss += loss
 
-            print(f"Epoch {epoch + 1}, Step: {step}, Loss: {loss}")   
+            print(f"Epoch {epoch + 1}, Batch: {batch_id}, Loss: {loss}")   
         
-        average_loss = total_loss / config.training_steps
+        average_loss = total_loss / config.number_of_batches
         print(f"Epoch {epoch + 1}, Average Loss: {average_loss}")
         
     print(f"Training done for {config.epochs} epochs")
-    print(f"Max timestep: {config.training_steps * config.unrolling_steps}")
 
     return params
 
-def update(params, optimizer, optimizer_state, simulation_hr, simulation_lr, f_lr, f_hr, corrector):
+def update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr, simulation_hr):
+    batch_size_hr = config.training_steps // config.number_of_batches + config.unrolling_steps
+    batch_size_lr = config.training_steps // config.number_of_batches
 
-    loss, grad = jax.value_and_grad(loss_fn)(params, simulation_lr, simulation_hr, f_lr, f_hr, corrector)
-
-    for i in range(config.unrolling_steps):
-        f_lr, _ = simulation_lr.step(f_lr, i)
-        f_hr, _ = simulation_hr.step(f_hr, i)
-        f_hr, _ = simulation_hr.step(f_hr, i)
+    step = batch_id * batch_size_lr
+    f_hr = dataset.get_hr_data(step, batch_size_hr)
+    f_lr_init = dataset.get_hr_data(step, batch_size_lr)
+    loss, grad = jax.value_and_grad(loss_fn)(params, simulation_lr, simulation_hr, f_lr_init, f_hr)
 
     updates, optimizer_state = optimizer.update(grad, optimizer_state)
     params = optax.apply_updates(params, updates)
-    return params, optimizer_state, loss, f_lr, f_hr
+    return params, optimizer_state, loss
 
-def loss_fn(params, simulation_lr, simulation_hr, f_lr, f_hr, corrector): 
-    f_lr_corrected = f_lr.copy()
-    f_hr = f_hr.copy()
-
+def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
     error = 0
+    batch_size = f_lr_init.shape[0]
     for i in range(config.unrolling_steps):
-        f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, i)
-        u_lr = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
-        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, ...].add(config.correction_factor *
-                                                                 corrector.apply(params, u_lr))
-    
-        f_hr, _ = simulation_hr.step(f_hr, i)
-        f_hr, _ = simulation_hr.step(f_hr, i)
-        f_hr_downsampled = downsample_field(f_hr, 2, method='bilinear')
-        
-        u_hr = simulation_hr.update_macroscopic(f_hr_downsampled[1:-1, 1:-1, :])[1]
-        u_lr_corrected = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
+        f_lr_corrected, _ = simulation_lr.step_vmapped(f_lr_init, 0, params)
 
-        error += jnp.mean((u_lr_corrected[1:-1, 1:-1, ...] - u_hr[1:-1, 1:-1, ...])**2) / jnp.mean(u_hr[1:-1, 1:-1, ...]**2)
+        u_lr_corrected = simulation_lr.compute_macroscopic_vmapped(f_lr_corrected[:, 1:-1, 1:-1, :])[1]
+        u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i:i + batch_size, 1:-1, 1:-1, :])[1]
+
+        error += jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, ...] - u_hr[:, 1:-1, 1:-1, ...])**2)
     return jnp.sum(error) / config.unrolling_steps
 
 def test_error(corrector, params, simulation_lr, simulation_hr):
@@ -206,22 +289,18 @@ def test_error(corrector, params, simulation_lr, simulation_hr):
     mean_error_without_corrector = []
 
     for timestep in range(config.test_steps):
-        f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, timestep)
-        u = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
-        f_lr_corrected = f_lr_corrected.at[1:-1, 1:-1, ...].add(config.correction_factor *
-                                                                 corrector.apply(params, u))
+        f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, timestep, params)
 
         f_lr, _ = simulation_lr.step(f_lr, timestep)
 
-        # Wo do two steps of HR simulation for every step of LR simulation
-        f_hr, _ = simulation_hr.step(f_hr, timestep)
-        f_hr, _ = simulation_hr.step(f_hr, timestep)
+        for i in range(config.scaling_factor):
+            f_hr, _ = simulation_hr.step(f_hr, timestep + i)
 
-        f_hr_downsampled = downsample_field(f_hr, 2, method='bilinear')
+        f_hr_downsampled = downsample_field(f_hr, config.scaling_factor, method='bicubic')
 
-        u_lr_corrected = simulation_lr.update_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
-        u_lr = simulation_lr.update_macroscopic(f_lr[1:-1, 1:-1, :])[1]
-        u_hr = simulation_hr.update_macroscopic(f_hr_downsampled[1:-1, 1:-1, :])[1]
+        u_lr_corrected = simulation_lr.compute_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
+        u_lr = simulation_lr.compute_macroscopic(f_lr[1:-1, 1:-1, :])[1]
+        u_hr = simulation_hr.compute_macroscopic(f_hr_downsampled[1:-1, 1:-1, :])[1]
 
         u_lr_corrected_magnitude = np.sqrt(u_lr_corrected[..., 0]**2 + u_lr_corrected[..., 1]**2)
         u_lr_magnitude = np.sqrt(u_lr[..., 0]**2 + u_lr[..., 1]**2)
@@ -304,26 +383,29 @@ def main():
     
     params_lr = prepare_simulation_parameters(config.nx_lr, config.ny_lr)
     params_hr = prepare_simulation_parameters(config.nx_hr, config.ny_hr)
-    simulation_lr = Cavity(**params_lr)
-    simulation_hr = Cavity(**params_hr)
     corrector = Corrector()
+    simulation_lr = Cavity(corrector=corrector, **params_lr)
+    simulation_hr = Cavity(**params_hr)
 
-    initial_params = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr - 2, config.ny_lr - 2, 2))) # "- 2" since we only apply corrector to the inner domain
+    dataset = Dataset(simulation_lr, simulation_hr)
+                           
+    initial_params = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr, config.ny_lr, 2))) # "- 2" since we only apply corrector to the inner domain
 
     # Load from checkpoint if the flag is set
     if config.load_from_checkpoint:
         print("Loading checkpoint...")
         initial_params = checkpoints.restore_checkpoint('./', initial_params)
 
-    param_count = sum(x.size for x in jax.tree_leaves(initial_params))
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(initial_params))
     print(f"Total number of parameters: {param_count}")
 
     optimizer = optax.adam(config.learning_rate)
     optimizer_state = optimizer.init(initial_params)
-    params = train_model(corrector, optimizer, initial_params, optimizer_state, simulation_lr, simulation_hr)
+    params = train_model(optimizer, dataset, initial_params, optimizer_state, simulation_lr, simulation_hr)
     
     print("Saving checkpoint...")
-    checkpoints.save_checkpoint('./', params, config.epochs, overwrite=True)
+    absolute_path = os.path.abspath('./')
+    checkpoints.save_checkpoint(absolute_path, params, config.epochs, overwrite=True)
     print("Checkpoint saved!")
 
     return corrector, params, simulation_lr, simulation_hr 

@@ -149,7 +149,6 @@ class LBMBase(object):
         self.boundingBoxIndices= self.bounding_box_indices()
         # Create boundary data for the simulation
         self._create_boundary_data()
-        self.force = self.get_force()
 
     @property
     def lattice(self):
@@ -833,7 +832,7 @@ class LBMBase(object):
         return jnp.dot(fneq, self.lattice.cc)
 
     @partial(jit, static_argnums=(0,), inline=True)
-    def update_macroscopic(self, f):
+    def compute_macroscopic(self, f):
         """
         This function computes the macroscopic variables (density and velocity) based on the 
         distribution functions (f).
@@ -981,7 +980,7 @@ class LBMBase(object):
 
             if io_flag:
                 # Update the macroscopic variables and save the previous values (for error computation)
-                rho_prev, u_prev = self.update_macroscopic(f)
+                rho_prev, u_prev = self.compute_macroscopic(f)
                 rho_prev = downsample_field(rho_prev, self.downsamplingFactor)
                 u_prev = downsample_field(u_prev, self.downsamplingFactor)
                 # Gather the data from all processes and convert it to numpy arrays (move to host memory)
@@ -998,7 +997,7 @@ class LBMBase(object):
             if io_flag:
                 # Save the simulation data
                 print(f"Saving data at timestep {timestep}/{t_max}")
-                rho, u = self.update_macroscopic(f)
+                rho, u = self.compute_macroscopic(f)
                 rho = downsample_field(rho, self.downsamplingFactor)
                 u = downsample_field(u, self.downsamplingFactor)
                 
@@ -1136,7 +1135,7 @@ class LBMBase(object):
         pass
 
     @partial(jit, static_argnums=(0,), inline=True)
-    def apply_force(self, f_postcollision, feq, rho, u):
+    def apply_force(self, force, f_postcollision, feq, rho, u):
         """
         add force based on exact-difference method due to Kupershtokh
 
@@ -1165,8 +1164,7 @@ class LBMBase(object):
         Boundary conditions. Physica A, 392, 1925-1930.
         Krüger, T., et al. (2017). The lattice Boltzmann method. Springer International Publishing, 10.978-3, 4-15.
         """
-        delta_u = self.get_force()
-        feq_force = self.equilibrium(rho, u + delta_u, cast_output=False)
+        feq_force = self.equilibrium(rho, u + force, cast_output=False)
         f_postcollision = f_postcollision + feq_force - feq
         return f_postcollision
     

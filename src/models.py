@@ -25,12 +25,12 @@ class BGKSim(LBMBase):
         the distribution function is relaxed towards the equilibrium distribution function.
         """
         f = self.precisionPolicy.cast_to_compute(f)
-        rho, u = self.update_macroscopic(f)
+        rho, u = self.compute_macroscopic(f)
         feq = self.equilibrium(rho, u, cast_output=False)
         fneq = f - feq
         fout = f - self.omega * fneq
         if self.force is not None:
-            fout = self.apply_force(fout, feq, rho, u)
+            fout = self.apply_force(self.force, fout, feq, rho, u)
         return self.precisionPolicy.cast_to_output(fout)
 
 class KBCSim(LBMBase):
@@ -52,7 +52,7 @@ class KBCSim(LBMBase):
         f = self.precisionPolicy.cast_to_compute(f)
         tiny = 1e-32
         beta = self.omega * 0.5
-        rho, u = self.update_macroscopic(f)
+        rho, u = self.compute_macroscopic(f)
         feq = self.equilibrium(rho, u, cast_output=False)
         fneq = f - feq
         if self.dim == 2:
@@ -67,7 +67,7 @@ class KBCSim(LBMBase):
 
         # add external force
         if self.force is not None:
-            fout = self.apply_force(fout, feq, rho, u)
+            fout = self.apply_force(self.force, fout, feq, rho, u)
         return self.precisionPolicy.cast_to_output(fout)
 
     @partial(jit, static_argnums=(0,), inline=True)
