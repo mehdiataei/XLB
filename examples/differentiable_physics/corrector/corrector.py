@@ -13,50 +13,109 @@ from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import flax.linen as nn
 from flax.training import checkpoints
-from src.boundary_conditions import BounceBack, EquilibriumBC
+from src.boundary_conditions import *
+from jax.experimental.multihost_utils import process_allgather
 from src.models import BGKSim, KBCSim
 from src.lattice import LatticeD2Q9
 from src.utils import downsample_field
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
-    nx_lr: int = 66
-    ny_lr: int = 66
+    nx_lr: int = 76
+    ny_lr: int = 20
     scaling_factor: int = 6
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: float = 100.0
-    unrolling_steps: int = 5
-    training_steps: int = 1000
-    test_steps: int = 1200
+    Re: float = 3000.0
+    unrolling_steps: int = 3
+    training_steps: int = 200
+    test_steps: int = 400
     epochs: int = 100
-    correction_factor: float = 1.e-3
-    learning_rate: float = 1e-2
+    correction_factor: float = 1.e-2
+    learning_rate: float = 1e-3
     load_from_checkpoint: bool = False
-    number_of_batches: int = 10
+    number_of_batches: int = 100
+    offset: int = 3000
 
 config = SimulationParameters()
-class Cavity(BGKSim):
+
+poiseuille_profile  = lambda x,x0,d,umax: np.maximum(0.,4.*umax/(d**2)*((x-x0)*d-(x-x0)**2))
+
+
+class Corrector(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        dim_x= x.shape[0]
+        dim_y = x.shape[1]
+        x = x.reshape(-1)
+        x = self._dense_relu(x, 64)
+        x = self._dense_relu(x, 128)
+        x = self._dense_relu(x, 256)
+        x = self._dense_relu(x, 128)
+        x = self._dense_relu(x, 64)
+        x = nn.Dense(features=dim_x*dim_y*2, use_bias=True)(x)
+        return x.reshape((dim_x, dim_y, 2))
+
+    def _dense_relu(self, x, features):
+        x = nn.Dense(features=features, bias_init=nn.initializers.ones_init())(x)
+        return nn.relu(x)
+
+def prepare_simulation_parameters(nx, ny):
+    lattice = LatticeD2Q9(config.precision)
+    characteristic_length = nx - 2
+    diam = ny // 4
+    viscosity = config.prescribed_velocity * characteristic_length / config.Re
+    omega = 1.0 / (3.0 * viscosity + 0.5)
+
+    return {
+        'diam': diam,
+        'prescribed_velocity': config.prescribed_velocity,
+        'lattice': lattice,
+        'omega': omega,
+        'nx': nx,
+        'ny': ny,
+        'nz': 0,
+        'precision': config.precision
+    }
+
+
+class Cylinder(BGKSim):
     def __init__(self, corrector=None, **kwargs):
-        self.prescribed_velocity = kwargs.pop("prescribed_velocity")
+        self.diam = kwargs.get('diam')
         self.corrector = corrector
+        self.prescribed_vel = kwargs.get('prescribed_velocity')
         super().__init__(**kwargs)
 
     def set_boundary_conditions(self):
+        # Define the cylinder surface
+        coord = np.array([(i, j) for i in range(self.nx) for j in range(self.ny)])
+        xx, yy = coord[:, 0], coord[:, 1]
+        cx, cy = self.nx / 4, self.ny / 2
+        cylinder = (xx - cx)**2 + (yy-cy)**2 <= (self.diam/2.)**2
+        cylinder = coord[cylinder]
+        self.BCs.append(BounceBackHalfway(tuple(cylinder.T), self.gridInfo, self.precisionPolicy))
+        # wall = np.concatenate([cylinder, self.boundingBoxIndices['top'], self.boundingBoxIndices['bottom']])
+        # self.BCs.append(BounceBack(tuple(wall.T), self.gridInfo, self.precisionPolicy))
 
-        walls = np.concatenate((self.boundingBoxIndices["left"], self.boundingBoxIndices["right"], self.boundingBoxIndices["bottom"]))
-        # apply bounce back boundary condition to the walls
-        self.BCs.append(BounceBack(tuple(walls.T), self.gridInfo, self.precisionPolicy))
+        outlet = self.boundingBoxIndices['right']
+        rho_outlet = np.ones(outlet.shape[0], dtype=self.precisionPolicy.compute_dtype)
+        self.BCs.append(ExtrapolationOutflow(tuple(outlet.T), self.gridInfo, self.precisionPolicy))
+        # self.BCs.append(Regularized(tuple(outlet.T), self.gridInfo, self.precisionPolicy, 'pressure', rho_outlet))
 
-        # apply inlet equilibrium boundary condition to the top wall
-        moving_wall = self.boundingBoxIndices["top"]
+        inlet = self.boundingBoxIndices['left']
+        rho_inlet = np.ones((inlet.shape[0], 1), dtype=self.precisionPolicy.compute_dtype)
+        vel_inlet = np.zeros(inlet.shape, dtype=self.precisionPolicy.compute_dtype)
+        yy_inlet = yy.reshape(self.nx, self.ny)[tuple(inlet.T)]
+        vel_inlet[:, 0] = poiseuille_profile(yy_inlet,
+                                             yy_inlet.min(),
+                                             yy_inlet.max()-yy_inlet.min(), 3.0 / 2.0 * self.prescribed_vel)
+        # self.BCs.append(EquilibriumBC(tuple(inlet.T), self.gridInfo, self.precisionPolicy, rho_inlet, vel_inlet))
+        self.BCs.append(Regularized(tuple(inlet.T), self.gridInfo, self.precisionPolicy, 'velocity', vel_inlet))
 
-        rho_wall = np.ones((moving_wall.shape[0], 1), dtype=self.precisionPolicy.compute_dtype)
-        vel_wall = np.zeros(moving_wall.shape, dtype=self.precisionPolicy.compute_dtype)
-        vel_wall[:, 0] = self.prescribed_velocity
-        self.BCs.append(EquilibriumBC(tuple(moving_wall.T), self.gridInfo, self.precisionPolicy, rho_wall, vel_wall))
+        wall = np.concatenate([self.boundingBoxIndices['top'], self.boundingBoxIndices['bottom']])
+        self.BCs.append(BounceBack(tuple(wall.T), self.gridInfo, self.precisionPolicy))
 
     @partial(jit, static_argnums=(0,), donate_argnums=(1,))
     def collision(self, f, params=None):
@@ -98,94 +157,6 @@ class Cavity(BGKSim):
         rho, u = vmap(self.compute_macroscopic, in_axes=(0))(f)
         return rho, u
 
-class Corrector(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        dim = x.shape[0]
-        x = x.reshape(-1)
-        x = self._dense_relu(x, 64)
-        x = self._dense_relu(x, 128)
-        x = self._dense_relu(x, 256)
-        x = self._dense_relu(x, 128)
-        x = self._dense_relu(x, 64)
-        x = nn.Dense(features=dim*dim*2, use_bias=True)(x)
-        return x.reshape((dim, dim, 2))
-
-    def _dense_relu(self, x, features):
-        x = nn.Dense(features=features, bias_init=nn.initializers.ones_init())(x)
-        return nn.relu(x)
-
-# class Corrector(nn.Module):
-#     def setup(self):
-#         # Encoder
-#         self.enc1 = nn.Conv(features=64, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-#         self.enc2 = nn.Conv(features=128, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-#         self.enc3 = nn.Conv(features=256, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-        
-#         # Decoder
-#         self.dec1 = nn.ConvTranspose(features=128, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-#         self.dec2 = nn.ConvTranspose(features=64, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-#         self.dec3 = nn.ConvTranspose(features=9, kernel_size=(3, 3), strides=(1, 1), padding='SAME', bias_init=nn.initializers.ones_init())
-
-#     def __call__(self, x):
-#         # Encoder
-#         x = nn.relu(self.enc1(x))
-#         x = nn.relu(self.enc2(x))
-#         x = nn.relu(self.enc3(x))
-
-#         # Decoder
-#         x = nn.relu(self.dec1(x))
-#         x = nn.relu(self.dec2(x))
-#         x = self.dec3(x)
-
-#         return x
-
-# class ResidualBlock(nn.Module):
-#     filters: int
-#     kernel_size: int = 3
-    
-#     @nn.compact
-#     def __call__(self, x):
-#         residual = x
-#         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-#                     kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
-#         x = nn.relu(x)
-#         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
-#                     kernel_init=nn.initializers.lecun_normal(), bias_init=nn.initializers.ones_init())(x)
-#         return nn.relu(x + residual)
-
-# class Corrector(nn.Module):
-#     layers: int = 18
-#     @nn.compact
-#     def __call__(self, x):
-#         # Initial Conv layer
-#         x = nn.Conv(32, kernel_size=(5, 5))(x)
-#         x = nn.relu(x)
-
-#         # Residual Blocks
-#         for _ in range(self.layers):
-#             x = ResidualBlock(32)(x)
-#         # Output layer
-#         x = nn.Conv(2, kernel_size=(5, 5))(x)
-        
-#         return x
-
-def prepare_simulation_parameters(nx, ny):
-    lattice = LatticeD2Q9(config.precision)
-    characteristic_length = nx - 2
-    viscosity = config.prescribed_velocity * characteristic_length / config.Re
-    omega = 1.0 / (3.0 * viscosity + 0.5)
-
-    return {
-        'prescribed_velocity': config.prescribed_velocity,
-        'lattice': lattice,
-        'omega': omega,
-        'nx': nx,
-        'ny': ny,
-        'nz': 0,
-        'precision': config.precision
-    }
-
 class Dataset(object):
     def __init__(self, simulation_lr, simulation_hr):
         self.simulation_lr_data = None
@@ -201,21 +172,30 @@ class Dataset(object):
         hr_data_list = []
 
         print("Generating low-resolution data...")
-        for step in range(config.training_steps):
+        for step in range(config.training_steps + config.offset):
             f_lr, _ = simulation_hr.step(f_lr, step)
 
-            lr_data_list.append(f_lr.copy())
+            if step >= config.offset:
+                lr_data_list.append(np.array(process_allgather(f_lr)))
+        print("Low-resolution data generated!")
 
         print("Generating high-resolution data...")
-        for step in range(config.training_steps + config.unrolling_steps):
+        for step in range(config.training_steps + config.unrolling_steps + config.offset):
             for i in range(config.scaling_factor):
                 f_hr, _ = simulation_hr.step(f_hr, step + i)
             
-            f_hr_downsampled = downsample_field(f_hr, config.scaling_factor, method='bicubic')
-            hr_data_list.append(f_hr_downsampled)
+            if step >= config.offset:
+                f_hr_downsampled = downsample_field(f_hr, config.scaling_factor, method='bicubic')
+                hr_data_list.append(np.array(process_allgather(f_hr_downsampled)))
 
+        print("High-resolution data generated!")
         self.simulation_lr_data = np.array(lr_data_list)
         self.simulation_hr_data = np.array(hr_data_list)
+
+        u_lr = simulation_lr.compute_macroscopic_vmapped(self.simulation_lr_data[-1, 1:-1, 1:-1, :])[1]     
+        u_hr = simulation_hr.compute_macroscopic_vmapped(self.simulation_hr_data[-1, 1:-1, 1:-1, :])[1]
+        error = np.mean((u_lr[1:-1, 1:-1, ...] - u_hr[1:-1, 1:-1, ...])**2)
+        print("Order of error to beat ~", error)
 
     def get_lr_data(self, step, batch_size):
         if step >= self.simulation_lr_data.shape[0]:
@@ -280,17 +260,24 @@ def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
         error += jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, ...] - u_hr[:, 1:-1, 1:-1, ...])**2)
     return jnp.sum(error) / config.unrolling_steps
 
-def test_error(corrector, params, simulation_lr, simulation_hr):
-    f_lr_corrected = simulation_lr.assign_fields_sharded()
-    f_lr = simulation_lr.assign_fields_sharded()
+def test_error(corrector, params, simulation_lr, simulation_hr, dataset):
+    print("Starting the test_error function...")
+    f_lr_corrected = dataset.get_hr_data(0, 1)[0]
+    f_lr = dataset.get_hr_data(0, 1)[0]
     f_hr = simulation_hr.assign_fields_sharded()
+    print("Initial data fetched successfully.")
+
+    for timestep in range(config.offset):
+        for i in range(config.scaling_factor):
+            f_hr, _ = simulation_hr.step(f_hr, timestep + i)
+    print("Preparation steps completed.")
 
     mean_error_with_corrector = []
     mean_error_without_corrector = []
+    print("Starting main simulation loop...")
 
     for timestep in range(config.test_steps):
         f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, timestep, params)
-
         f_lr, _ = simulation_lr.step(f_lr, timestep)
 
         for i in range(config.scaling_factor):
@@ -305,25 +292,31 @@ def test_error(corrector, params, simulation_lr, simulation_hr):
         u_lr_corrected_magnitude = np.sqrt(u_lr_corrected[..., 0]**2 + u_lr_corrected[..., 1]**2)
         u_lr_magnitude = np.sqrt(u_lr[..., 0]**2 + u_lr[..., 1]**2)
         u_hr_magnitude = np.sqrt(u_hr[..., 0]**2 + u_hr[..., 1]**2)
-        
+
         mean_error_with_corrector.append(np.mean(np.abs(u_hr_magnitude - u_lr_corrected_magnitude)))
         mean_error_without_corrector.append(np.mean(np.abs(u_hr_magnitude - u_lr_magnitude)))
 
+    print("Main simulation loop finished.")
 
     error_with_corrector = np.abs(u_hr_magnitude - u_lr_corrected_magnitude)
     error_without_corrector = np.abs(u_hr_magnitude - u_lr_magnitude)
 
     max_error = np.max([error_without_corrector.max(), error_with_corrector.max()])
     min_error = np.min([error_without_corrector.min(), error_with_corrector.min()])
+    print("Maximum error calculated: ", max_error)
+    print("Minimum error calculated: ", min_error)
 
     max_velocity = np.max([u_lr_corrected_magnitude.max(), u_lr_magnitude.max(), u_hr_magnitude.max()])
     min_velocity = np.min([u_lr_corrected_magnitude.min(), u_lr_magnitude.min(), u_hr_magnitude.min()])
+    print("Maximum velocity calculated: ", max_velocity)
+    print("Minimum velocity calculated: ", min_velocity)
 
-    # Print all the error averages
+    print("Printing all error averages...")
     print("Error with corrector: ", mean_error_with_corrector[-1])
     print("Error without corrector: ", mean_error_without_corrector[-1])
     print("Error without corrector / Error with corrector: ", mean_error_without_corrector[-1] / mean_error_with_corrector[-1])
 
+    print("Generating error plots...")
     # Figure for errors
     fig_error = plt.figure(figsize=(10, 4))
     ax1 = fig_error.add_subplot(1, 2, 1)
@@ -365,8 +358,8 @@ def test_error(corrector, params, simulation_lr, simulation_hr):
     fig_u_magnitude.savefig("u_magnitude.png", dpi=600)
 
     fig_mean_error = plt.figure(figsize=(8, 8))
-    plt.plot(range(config.test_steps), mean_error_with_corrector, label='With Corrector')
-    plt.plot(range(config.test_steps), mean_error_without_corrector, label='Without Corrector')
+    plt.plot(range(config.training_steps, config.test_steps), mean_error_with_corrector[config.training_steps:], label='With Corrector')
+    plt.plot(range(config.training_steps, config.test_steps), mean_error_without_corrector[config.training_steps:], label='Without Corrector')
 
     plt.xlabel('Timesteps', fontsize=16)
     plt.ylabel(r'Mean $L_2$ Error', fontsize=16)
@@ -384,8 +377,8 @@ def main():
     params_lr = prepare_simulation_parameters(config.nx_lr, config.ny_lr)
     params_hr = prepare_simulation_parameters(config.nx_hr, config.ny_hr)
     corrector = Corrector()
-    simulation_lr = Cavity(corrector=corrector, **params_lr)
-    simulation_hr = Cavity(**params_hr)
+    simulation_lr = Cylinder(corrector=corrector, **params_lr)
+    simulation_hr = Cylinder(**params_hr)
 
     dataset = Dataset(simulation_lr, simulation_hr)
                            
@@ -408,8 +401,8 @@ def main():
     checkpoints.save_checkpoint(absolute_path, params, config.epochs, overwrite=True)
     print("Checkpoint saved!")
 
-    return corrector, params, simulation_lr, simulation_hr 
+    return corrector, params, simulation_lr, simulation_hr, dataset
 
 if __name__ == "__main__":
-    corrector, params, simulation_lr, simulation_hr  = main()
-    test_error(corrector, params, simulation_lr, simulation_hr)
+    corrector, params, simulation_lr, simulation_hr, dataset  = main()
+    test_error(corrector, params, simulation_lr, simulation_hr, dataset)
