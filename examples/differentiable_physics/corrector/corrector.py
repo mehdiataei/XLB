@@ -7,7 +7,7 @@ import numpy as np
 import jax.lax as lax
 import jax.numpy as jnp
 from jax import vmap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -18,55 +18,88 @@ from jax.experimental.multihost_utils import process_allgather
 from src.models import BGKSim, KBCSim
 from src.lattice import LatticeD2Q9
 from src.utils import downsample_field
+from typing import List
+
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
     nx_lr: int = 76
     ny_lr: int = 20
-    scaling_factor: int = 6
+    scaling_factor: int = 4
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: float = 3000.0
-    unrolling_steps: int = 3
-    training_steps: int = 200
-    test_steps: int = 400
-    epochs: int = 100
-    correction_factor: float = 1.e-2
-    learning_rate: float = 1e-3
+    Re: List[float] = field(default_factory=lambda: [1000, 1100, 1200, 1500])
+    Re_test: float = 1250
+    unrolling_steps: int = 4
+    steps: int = 300
+    epochs: int = 5
+    correction_factor: float = 1.e-3
+    learning_rate: float = 1e-4
+    l1_coef: float = 0.0
     load_from_checkpoint: bool = False
-    number_of_batches: int = 100
-    offset: int = 3000
+    batch_size: int = 4
+    offset: int = 10000
 
 config = SimulationParameters()
 
 poiseuille_profile  = lambda x,x0,d,umax: np.maximum(0.,4.*umax/(d**2)*((x-x0)*d-(x-x0)**2))
 
 
-class Corrector(nn.Module):
+# class Corrector(nn.Module):
+#     @nn.compact
+#     def __call__(self, x):
+#         shape = x.shape
+#         x = x.reshape(-1)
+#         x = self._dense(x, 32)
+#         x = self._dense(x, 64)
+#         x = self._dense(x, 64)
+#         x = self._dense(x, 32)
+#         x = nn.Dense(features=np.prod(shape))(x)
+#         return x.reshape(shape)
+
+#     def _dense(self, x, features):
+#         x = nn.Dense(features=features, kernel_init=nn.initializers.he_normal(), bias_init=nn.initializers.zeros_init())(x)
+#         return nn.leaky_relu(x)
+
+class ResidualBlock(nn.Module):
+    filters: int
+    kernel_size: int = 3
+    
     @nn.compact
     def __call__(self, x):
-        dim_x= x.shape[0]
-        dim_y = x.shape[1]
-        x = x.reshape(-1)
-        x = self._dense_relu(x, 64)
-        x = self._dense_relu(x, 128)
-        x = self._dense_relu(x, 256)
-        x = self._dense_relu(x, 128)
-        x = self._dense_relu(x, 64)
-        x = nn.Dense(features=dim_x*dim_y*2, use_bias=True)(x)
-        return x.reshape((dim_x, dim_y, 2))
+        residual = x
+        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
+                    kernel_init=nn.initializers.he_uniform(), bias_init=nn.initializers.ones_init())(x)
+        x = nn.relu(x)
+        x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
+                    kernel_init=nn.initializers.he_uniform(), bias_init=nn.initializers.ones_init())(x)
+        return nn.relu(x + residual)
 
-    def _dense_relu(self, x, features):
-        x = nn.Dense(features=features, bias_init=nn.initializers.ones_init())(x)
-        return nn.relu(x)
 
-def prepare_simulation_parameters(nx, ny):
+class Corrector(nn.Module):
+    layers: int = 2
+    @nn.compact
+    def __call__(self, x):
+
+        # Initial Conv layer
+        x = nn.Conv(64, kernel_size=(5, 5))(x)
+        x = nn.relu(x)
+
+        # Residual Blocks
+        for _ in range(self.layers):
+            x = ResidualBlock(64)(x)
+        # Output layer
+        x = nn.Conv(2, kernel_size=(5, 5))(x)
+        
+        return x
+    
+def prepare_simulation_parameters(nx, ny, Re):
     lattice = LatticeD2Q9(config.precision)
     characteristic_length = nx - 2
     diam = ny // 4
-    viscosity = config.prescribed_velocity * characteristic_length / config.Re
+    viscosity = config.prescribed_velocity * characteristic_length / Re
     omega = 1.0 / (3.0 * viscosity + 0.5)
 
     return {
@@ -82,9 +115,10 @@ def prepare_simulation_parameters(nx, ny):
 
 
 class Cylinder(BGKSim):
-    def __init__(self, corrector=None, **kwargs):
+    def __init__(self, Re, corrector=None, **kwargs):
         self.diam = kwargs.get('diam')
         self.corrector = corrector
+        self.Re = Re
         self.prescribed_vel = kwargs.get('prescribed_velocity')
         super().__init__(**kwargs)
 
@@ -125,7 +159,11 @@ class Cylinder(BGKSim):
         fneq = f - feq
         fout = f - self.omega * fneq
         if params is not None:
+            # Re_channel = self.Re * jnp.ones_like(u[..., :1])
+            # x = jnp.concatenate([u, Re_channel], axis=-1)
+            # force = config.correction_factor * self.corrector.apply(params, x)
             force = config.correction_factor * self.corrector.apply(params, u)
+
             fout = self.apply_force(force, fout, feq, rho, u)
 
         return self.precisionPolicy.cast_to_output(fout)
@@ -172,7 +210,8 @@ class Dataset(object):
         hr_data_list = []
 
         print("Generating low-resolution data...")
-        for step in range(config.training_steps + config.offset):
+        req_range = config.steps + config.offset + config.batch_size
+        for step in range(config.steps + config.offset + config.batch_size):
             f_lr, _ = simulation_hr.step(f_lr, step)
 
             if step >= config.offset:
@@ -180,7 +219,8 @@ class Dataset(object):
         print("Low-resolution data generated!")
 
         print("Generating high-resolution data...")
-        for step in range(config.training_steps + config.unrolling_steps + config.offset):
+        req_range = config.steps + config.batch_size + config.unrolling_steps + config.offset
+        for step in range(req_range):
             for i in range(config.scaling_factor):
                 f_hr, _ = simulation_hr.step(f_hr, step + i)
             
@@ -217,29 +257,30 @@ class Dataset(object):
 
         return self.simulation_hr_data[step:end_step]
 
-def train_model(optimizer, dataset, initial_params, optimizer_state, simulation_lr, simulation_hr):
-    params = initial_params
+def train_model(optimizer, dataset, params_nn, optimizer_state, simulation_lr, simulation_hr):
+    params = params_nn
     for epoch in range(config.epochs):
-        total_loss = 0
-
-        for batch_id in range(config.number_of_batches):
+        epoch_loss = 0
+        number_of_batches = config.steps // config.batch_size
+        for batch_id in range(number_of_batches):
             params, optimizer_state, loss = update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr, simulation_hr)
-            total_loss += loss
+            epoch_loss += loss
 
-            print(f"Epoch {epoch + 1}, Batch: {batch_id}, Loss: {loss}")   
+            print(f"Epoch {epoch + 1}, Batch: {batch_id} / {number_of_batches}, Loss: {loss}")   
         
-        average_loss = total_loss / config.number_of_batches
-        print(f"Epoch {epoch + 1}, Average Loss: {average_loss}")
+        average_loss = epoch_loss / number_of_batches
+        print(f"Epoch {epoch + 1}, Average Loss over all steps: {average_loss}")
         
     print(f"Training done for {config.epochs} epochs")
 
     return params
 
 def update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr, simulation_hr):
-    batch_size_hr = config.training_steps // config.number_of_batches + config.unrolling_steps
-    batch_size_lr = config.training_steps // config.number_of_batches
+    batch_size_hr =  config.batch_size + config.unrolling_steps
+    batch_size_lr =  config.batch_size
 
-    step = batch_id * batch_size_lr
+    step = batch_id * config.batch_size
+
     f_hr = dataset.get_hr_data(step, batch_size_hr)
     f_lr_init = dataset.get_hr_data(step, batch_size_lr)
     loss, grad = jax.value_and_grad(loss_fn)(params, simulation_lr, simulation_hr, f_lr_init, f_hr)
@@ -255,39 +296,44 @@ def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
         f_lr_corrected, _ = simulation_lr.step_vmapped(f_lr_init, 0, params)
 
         u_lr_corrected = simulation_lr.compute_macroscopic_vmapped(f_lr_corrected[:, 1:-1, 1:-1, :])[1]
-        u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i:i + batch_size, 1:-1, 1:-1, :])[1]
+        u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i + 1:i + 1 + batch_size, 1:-1, 1:-1, :])[1]
+        l2_x = jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0])**2)
+        l2_y = jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1])**2)
+        l1_x = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0]))
+        l1_y = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1]))
+        error += l2_x + l2_y + l1_x + l1_y
 
-        error += jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, ...] - u_hr[:, 1:-1, 1:-1, ...])**2)
-    return jnp.sum(error) / config.unrolling_steps
+    l1_penalty = 0
+    for p in jax.tree_util.tree_leaves(params):
+        l1_penalty += jnp.sum(jnp.abs(p))
 
-def test_error(corrector, params, simulation_lr, simulation_hr, dataset):
-    print("Starting the test_error function...")
+    return error / config.unrolling_steps + config.l1_coef * l1_penalty
+
+
+def test_error(params, simulation_lr, simulation_hr):
+    print(f"Testing for {config.Re_test}...")
+    params_lr = prepare_simulation_parameters(config.nx_lr, config.ny_lr, config.Re_test)
+    params_hr = prepare_simulation_parameters(config.nx_hr, config.ny_hr, config.Re_test)
+    corrector = Corrector()
+    simulation_lr = Cylinder(config.Re_test, corrector=corrector, **params_lr)
+    simulation_hr = Cylinder(config.Re_test, **params_hr) 
+    dataset = Dataset(simulation_lr, simulation_hr)
+
     f_lr_corrected = dataset.get_hr_data(0, 1)[0]
     f_lr = dataset.get_hr_data(0, 1)[0]
-    f_hr = simulation_hr.assign_fields_sharded()
-    print("Initial data fetched successfully.")
-
-    for timestep in range(config.offset):
-        for i in range(config.scaling_factor):
-            f_hr, _ = simulation_hr.step(f_hr, timestep + i)
-    print("Preparation steps completed.")
+    print("Initial data setup finished.")
 
     mean_error_with_corrector = []
     mean_error_without_corrector = []
     print("Starting main simulation loop...")
 
-    for timestep in range(config.test_steps):
+    for timestep in range(config.steps):
         f_lr_corrected, _ = simulation_lr.step(f_lr_corrected, timestep, params)
         f_lr, _ = simulation_lr.step(f_lr, timestep)
 
-        for i in range(config.scaling_factor):
-            f_hr, _ = simulation_hr.step(f_hr, timestep + i)
-
-        f_hr_downsampled = downsample_field(f_hr, config.scaling_factor, method='bicubic')
-
         u_lr_corrected = simulation_lr.compute_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
         u_lr = simulation_lr.compute_macroscopic(f_lr[1:-1, 1:-1, :])[1]
-        u_hr = simulation_hr.compute_macroscopic(f_hr_downsampled[1:-1, 1:-1, :])[1]
+        u_hr = simulation_hr.compute_macroscopic(dataset.get_hr_data(timestep, 1)[0][1:-1, 1:-1, :])[1]
 
         u_lr_corrected_magnitude = np.sqrt(u_lr_corrected[..., 0]**2 + u_lr_corrected[..., 1]**2)
         u_lr_magnitude = np.sqrt(u_lr[..., 0]**2 + u_lr[..., 1]**2)
@@ -358,8 +404,8 @@ def test_error(corrector, params, simulation_lr, simulation_hr, dataset):
     fig_u_magnitude.savefig("u_magnitude.png", dpi=600)
 
     fig_mean_error = plt.figure(figsize=(8, 8))
-    plt.plot(range(config.training_steps, config.test_steps), mean_error_with_corrector[config.training_steps:], label='With Corrector')
-    plt.plot(range(config.training_steps, config.test_steps), mean_error_without_corrector[config.training_steps:], label='Without Corrector')
+    plt.plot(range(config.steps), mean_error_with_corrector, label='With Corrector')
+    plt.plot(range(config.steps), mean_error_without_corrector, label='Without Corrector')
 
     plt.xlabel('Timesteps', fontsize=16)
     plt.ylabel(r'Mean $L_2$ Error', fontsize=16)
@@ -372,37 +418,36 @@ def test_error(corrector, params, simulation_lr, simulation_hr, dataset):
 
 
 def main():
-    os.system("rm -rf ./*.vtk && rm -rf ./*.png")
-    
-    params_lr = prepare_simulation_parameters(config.nx_lr, config.ny_lr)
-    params_hr = prepare_simulation_parameters(config.nx_hr, config.ny_hr)
     corrector = Corrector()
-    simulation_lr = Cylinder(corrector=corrector, **params_lr)
-    simulation_hr = Cylinder(**params_hr)
-
-    dataset = Dataset(simulation_lr, simulation_hr)
-                           
-    initial_params = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr, config.ny_lr, 2))) # "- 2" since we only apply corrector to the inner domain
-
-    # Load from checkpoint if the flag is set
+    params_nn = corrector.init(jax.random.PRNGKey(0), jnp.zeros((config.nx_lr, config.ny_lr, 2)))
     if config.load_from_checkpoint:
         print("Loading checkpoint...")
-        initial_params = checkpoints.restore_checkpoint('./', initial_params)
+        params_nn = checkpoints.restore_checkpoint('./', params_nn)
 
-    param_count = sum(x.size for x in jax.tree_util.tree_leaves(initial_params))
-    print(f"Total number of parameters: {param_count}")
+    param_count = sum(x.size for x in jax.tree_util.tree_leaves(params_nn))
+    print(f"Total number of trainable parameters: {param_count}")
 
     optimizer = optax.adam(config.learning_rate)
-    optimizer_state = optimizer.init(initial_params)
-    params = train_model(optimizer, dataset, initial_params, optimizer_state, simulation_lr, simulation_hr)
-    
+    optimizer_state = optimizer.init(params_nn)
+
+    for Re in config.Re:
+        print(f"Training for Re = {Re}...")
+        params_lr = prepare_simulation_parameters(config.nx_lr, config.ny_lr, Re)
+        params_hr = prepare_simulation_parameters(config.nx_hr, config.ny_hr, Re)
+        simulation_lr = Cylinder(Re, corrector=corrector, **params_lr)
+        simulation_hr = Cylinder(Re, **params_hr)
+        
+        dataset = Dataset(simulation_lr, simulation_hr)
+        params_nn = train_model(optimizer, dataset, params_nn, optimizer_state, simulation_lr, simulation_hr)
+        
     print("Saving checkpoint...")
     absolute_path = os.path.abspath('./')
-    checkpoints.save_checkpoint(absolute_path, params, config.epochs, overwrite=True)
+    checkpoints.save_checkpoint(absolute_path, params_nn, config.epochs, overwrite=True)
     print("Checkpoint saved!")
 
-    return corrector, params, simulation_lr, simulation_hr, dataset
+    return params_nn, simulation_lr, simulation_hr
 
 if __name__ == "__main__":
-    corrector, params, simulation_lr, simulation_hr, dataset  = main()
-    test_error(corrector, params, simulation_lr, simulation_hr, dataset)
+    os.system("rm -rf ./*.vtk && rm -rf ./*.png")
+    params_nn, simulation_lr, simulation_hr  = main()
+    test_error(params_nn, simulation_lr, simulation_hr)
