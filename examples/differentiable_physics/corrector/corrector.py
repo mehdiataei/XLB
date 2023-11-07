@@ -23,24 +23,24 @@ from typing import List
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
-    nx_lr: int = 76
-    ny_lr: int = 20
-    scaling_factor: int = 4
+    nx_lr: int = 76 * 2
+    ny_lr: int = 20 * 2
+    scaling_factor: int = 2
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: List[float] = field(default_factory=lambda: [1000, 1100, 1200, 1500])
-    Re_test: float = 1250
+    Re: List[float] = field(default_factory=lambda: [1000, 1100, 1200])
+    Re_test: float = 1050
     unrolling_steps: int = 4
     steps: int = 300
-    epochs: int = 5
+    epochs: int = 10
     correction_factor: float = 1.e-3
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3
     l1_coef: float = 0.0
     load_from_checkpoint: bool = False
-    batch_size: int = 4
-    offset: int = 10000
+    batch_size: int = 10
+    offset: int = 5000
 
 config = SimulationParameters()
 
@@ -72,14 +72,14 @@ class ResidualBlock(nn.Module):
         residual = x
         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
                     kernel_init=nn.initializers.he_uniform(), bias_init=nn.initializers.ones_init())(x)
-        x = nn.relu(x)
+        x = nn.leaky_relu(x)
         x = nn.Conv(self.filters, kernel_size=(self.kernel_size, self.kernel_size), 
                     kernel_init=nn.initializers.he_uniform(), bias_init=nn.initializers.ones_init())(x)
         return nn.relu(x + residual)
 
 
 class Corrector(nn.Module):
-    layers: int = 2
+    layers: int = 4
     @nn.compact
     def __call__(self, x):
 
@@ -284,6 +284,7 @@ def update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr,
     f_hr = dataset.get_hr_data(step, batch_size_hr)
     f_lr_init = dataset.get_hr_data(step, batch_size_lr)
     loss, grad = jax.value_and_grad(loss_fn)(params, simulation_lr, simulation_hr, f_lr_init, f_hr)
+    # scaled_grad = jax.tree_map(lambda g: g / 1000, grad)
 
     updates, optimizer_state = optimizer.update(grad, optimizer_state)
     params = optax.apply_updates(params, updates)
@@ -295,19 +296,19 @@ def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
     for i in range(config.unrolling_steps):
         f_lr_corrected, _ = simulation_lr.step_vmapped(f_lr_init, 0, params)
 
-        u_lr_corrected = simulation_lr.compute_macroscopic_vmapped(f_lr_corrected[:, 1:-1, 1:-1, :])[1]
-        u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i + 1:i + 1 + batch_size, 1:-1, 1:-1, :])[1]
-        l2_x = jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0])**2)
-        l2_y = jnp.mean((u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1])**2)
-        l1_x = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0]))
-        l1_y = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1]))
-        error += l2_x + l2_y + l1_x + l1_y
+        u_lr_corrected = simulation_lr.compute_macroscopic_vmapped(f_lr_corrected)[1]
+        u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i + 1:i + 1 + batch_size, ...])[1]
+        l2_x = jnp.mean((u_lr_corrected[..., 0] - u_hr[..., 0])**2)
+        l2_y = jnp.mean((u_lr_corrected[..., 1] - u_hr[..., 1])**2)
+        # l1_x = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0]))
+        # l1_y = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1]))
+        error += l2_x + l2_y # + l1_x + l1_y
 
-    l1_penalty = 0
-    for p in jax.tree_util.tree_leaves(params):
-        l1_penalty += jnp.sum(jnp.abs(p))
+    # l1_penalty = 0
+    # for p in jax.tree_util.tree_leaves(params):
+    #     l1_penalty += jnp.sum(jnp.abs(p))
 
-    return error / config.unrolling_steps + config.l1_coef * l1_penalty
+    return error / config.unrolling_steps#+ config.l1_coef * l1_penalty
 
 
 def test_error(params, simulation_lr, simulation_hr):
@@ -333,7 +334,7 @@ def test_error(params, simulation_lr, simulation_hr):
 
         u_lr_corrected = simulation_lr.compute_macroscopic(f_lr_corrected[1:-1, 1:-1, :])[1]
         u_lr = simulation_lr.compute_macroscopic(f_lr[1:-1, 1:-1, :])[1]
-        u_hr = simulation_hr.compute_macroscopic(dataset.get_hr_data(timestep, 1)[0][1:-1, 1:-1, :])[1]
+        u_hr = simulation_hr.compute_macroscopic(dataset.get_hr_data(timestep+1, 1)[0][1:-1, 1:-1, :])[1]
 
         u_lr_corrected_magnitude = np.sqrt(u_lr_corrected[..., 0]**2 + u_lr_corrected[..., 1]**2)
         u_lr_magnitude = np.sqrt(u_lr[..., 0]**2 + u_lr[..., 1]**2)
