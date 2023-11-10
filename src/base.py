@@ -149,6 +149,7 @@ class LBMBase(object):
         self.boundingBoxIndices= self.bounding_box_indices()
         # Create boundary data for the simulation
         self._create_boundary_data()
+        self.force = None
 
     @property
     def lattice(self):

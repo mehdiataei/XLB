@@ -23,19 +23,19 @@ from typing import List
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
-    nx_lr: int = 76 * 2
-    ny_lr: int = 20 * 2
+    nx_lr: int = 76
+    ny_lr: int = 20
     scaling_factor: int = 2
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: List[float] = field(default_factory=lambda: [1000, 1100, 1200])
+    Re: List[float] = field(default_factory=lambda: [1000, 1100])
     Re_test: float = 1050
-    unrolling_steps: int = 100
-    steps: int = 300
-    epochs: int = 10
-    correction_factor: float = 1.e-3
+    unrolling_steps: int = 50
+    steps: int = 200
+    epochs: int = 20
+    correction_factor: float = 1.e-4
     learning_rate: float = 1e-3
     l1_coef: float = 0.0
     load_from_checkpoint: bool = False
@@ -84,12 +84,12 @@ class Corrector(nn.Module):
     def __call__(self, x):
 
         # Initial Conv layer
-        x = nn.Conv(64, kernel_size=(5, 5))(x)
+        x = nn.Conv(32, kernel_size=(5, 5))(x)
         x = nn.relu(x)
 
         # Residual Blocks
         for _ in range(self.layers):
-            x = ResidualBlock(64)(x)
+            x = ResidualBlock(32)(x)
         # Output layer
         x = nn.Conv(2, kernel_size=(5, 5))(x)
         
@@ -152,7 +152,7 @@ class Cylinder(BGKSim):
         self.BCs.append(BounceBack(tuple(wall.T), self.gridInfo, self.precisionPolicy))
 
     @partial(jit, static_argnums=(0,), donate_argnums=(1,))
-    @jax.checkpoint
+    @partial(jax.checkpoint, static_argnums=(0,))
     def collision(self, f, params=None):
         f = self.precisionPolicy.cast_to_compute(f)
         rho, u = self.compute_macroscopic(f)
