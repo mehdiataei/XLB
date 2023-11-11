@@ -24,19 +24,18 @@ from PIL import Image, ImageDraw, ImageFont
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
-    nx: int = 200
-    ny: int = 200
+    nx: int = 300
+    ny: int = 300
     precision: str = "f32/f32"
-    steps: int = 10
+    steps: int = 200
     epochs: int = 300
-    correction_factor: float = 1e-4
+    correction_factor: float = 1e-2
     learning_rate: float = 1e-4
-    load_from_checkpoint: bool = False
-    bump_size = 1e-5
-    omega = 1.8
+    load_from_checkpoint: bool = True
+    bump_size = 1e-3
+    omega = 1.0
 
 config = SimulationParameters()
-
 
 class Initializer(nn.Module):
     @nn.compact
@@ -48,7 +47,7 @@ class Initializer(nn.Module):
         x = self._dense(x, 32)
         x = nn.Dense(features=np.prod(shape))(x)
         x = x.reshape(shape)
-        x = jnp.tanh(x)
+        # x = nn.tanh(x)
         return x
 
 
@@ -56,7 +55,7 @@ class Initializer(nn.Module):
         x = nn.Dense(features=features, kernel_init=nn.initializers.he_normal(), bias_init=nn.initializers.zeros_init())(x)
         return nn.leaky_relu(x)
 
-def prepare_simulation_parameters(nx, ny, xx, yy, vel_ref, omega):
+def prepare_simulation_parameters(nx, ny, omega):
     lattice = LatticeD2Q9(config.precision)
     return {
         'lattice': lattice,
@@ -65,41 +64,12 @@ def prepare_simulation_parameters(nx, ny, xx, yy, vel_ref, omega):
         'ny': ny,
         'nz': 0,
         'precision': config.precision,
-        'xx': xx,
-        'yy': yy,
-        'vel_ref': vel_ref
     }
 
 
-# class Block(BGKSim):
-#     def __init__(self, initializer_nn=None, **kwargs):
-#         self.initializer_nn = initializer_nn
-#         super().__init__(**kwargs)
-
-
-def taylor_green_initial_fields(xx, yy, u0, rho0, nu, time):
-    ux = u0 * np.sin(xx) * np.cos(yy) * np.exp(-2 * nu * time)
-    uy = -u0 * np.cos(xx) * np.sin(yy) * np.exp(-2 * nu * time)
-    rho = 1.0 - rho0 * u0 ** 2 / 12. * (np.cos(2. * xx) + np.cos(2. * yy)) * np.exp(-4 * nu * time)
-    return ux, uy, np.expand_dims(rho, axis=-1)
-
-class TaylorGreenVortex(BGKSim):
+class Block(BGKSim):
     def __init__(self, **kwargs):
-        self.xx = kwargs.pop('xx')
-        self.yy = kwargs.pop('yy')
-        self.vel_ref = kwargs.pop('vel_ref')
         super().__init__(**kwargs)
-
-    def set_boundary_conditions(self):
-        # no boundary conditions implying periodic BC in all directions
-        return
-
-    def initialize_macroscopic_fields(self):
-        ux, uy, rho = taylor_green_initial_fields(self.xx, self.yy, self.vel_ref, 1, 0., 0.)
-        rho = self.distributed_array_init(rho.shape, self.precisionPolicy.output_dtype, init_val=rho, sharding=self.sharding)
-        u = np.stack([ux, uy], axis=-1)
-        u = self.distributed_array_init(u.shape, self.precisionPolicy.output_dtype, init_val=u, sharding=self.sharding)
-        return rho, u
 
 def create_XLB_field(nx, ny, bump_size):
     image = Image.new('RGB', (nx, ny), 'white')
@@ -150,7 +120,8 @@ def train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulatio
 
 
 def update(params, initializer_nn, optimizer, optimizer_state, simulation):
-    rho_init, u_init = simulation.initialize_macroscopic_fields()
+    rho_init = jnp.ones((config.nx, config.ny, 1))
+    u_init = jnp.zeros((config.nx, config.ny, 2))
     desired_rho = create_XLB_field(config.nx, config.ny, config.bump_size)
     
     def loss_fn(params, rho_init, u_init, desired_rho):
@@ -162,10 +133,6 @@ def update(params, initializer_nn, optimizer, optimizer_state, simulation):
         rho, u = simulation.compute_macroscopic(f)
         error_l2 = jnp.sum((rho - desired_rho)**2)
 
-        # l1_penalty = 0
-        # for p in jax.tree_util.tree_leaves(params):
-        #     l1_penalty += jnp.sum(jnp.abs(p))
-
         return error_l2
 
     loss, grad = jax.value_and_grad(loss_fn)(params, rho_init, u_init, desired_rho)
@@ -175,7 +142,8 @@ def update(params, initializer_nn, optimizer, optimizer_state, simulation):
     return params, optimizer_state, loss
 
 def visualize_result(params_nn, initializer_nn, simulation):
-    rho_init, u_init = simulation.initialize_macroscopic_fields()
+    rho_init = jnp.ones((config.nx, config.ny, 1))
+    u_init = jnp.zeros((config.nx, config.ny, 2))
     rho_init += config.correction_factor * initializer_nn.apply(params_nn, rho_init)
 
     fig = plt.figure(figsize=(10, 10))
@@ -184,21 +152,22 @@ def visualize_result(params_nn, initializer_nn, simulation):
     plt.savefig(f'init_{str(0).zfill(4)}.png', dpi=600, bbox_inches='tight')
 
     f = simulation.equilibrium(rho_init, u_init)
-    for i in range(config.steps * 2):
+    rho_init, u_init = simulation.compute_macroscopic(f)
+    for i in range(config.steps):
         f, _ = simulation.step(f, i)
         rho, u = simulation.compute_macroscopic(f)
 
-        if i % 2 == 0 or i == config.steps * 2:
-            fig, ax = plt.subplots(figsize=(10, 10))
-            plt.axis('off') 
-            im = ax.imshow(rho[:, :, 0], cmap='viridis')
+        # if i % config.steps == 0 or i == config.steps * 2:
+        #     fig, ax = plt.subplots(figsize=(10, 10))
+        #     plt.axis('off') 
+        #     im = ax.imshow(rho[:, :, 0], cmap='viridis')
 
-            divider = make_axes_locatable(ax)
-            cax = divider.append_axes('right', size='5%', pad=0.05)
-            fig.colorbar(im, cax=cax, orientation='vertical')
+        #     divider = make_axes_locatable(ax)
+        #     cax = divider.append_axes('right', size='5%', pad=0.05)
+        #     fig.colorbar(im, cax=cax, orientation='vertical')
 
-            plt.savefig(f'simulation_results_{str(i).zfill(4)}.png', dpi=600, bbox_inches='tight')
-            plt.close(fig)  # Close the figure to free memory
+        #     plt.savefig(f'simulation_results_{str(i).zfill(4)}.png', dpi=600, bbox_inches='tight')
+        #     plt.close(fig)
 
     rho_final, u_final = simulation.compute_macroscopic(f)
     desired_rho = create_XLB_field(config.nx, config.ny, config.bump_size)
@@ -223,10 +192,10 @@ def visualize_result(params_nn, initializer_nn, simulation):
     cax3 = divider3.append_axes('right', size='5%', pad=0.05)
     fig.colorbar(im3, cax=cax3, orientation='vertical')
 
+    plt.subplots_adjust(left=0.05, right=0.95, wspace=0.20, hspace=0.20)
+
     plt.savefig('simulation_results.png', dpi=600, bbox_inches='tight')
     plt.show()
-
-
 
 def main():
     initializer_nn = Initializer()
@@ -242,23 +211,8 @@ def main():
     optimizer = optax.adam(config.learning_rate)
     optimizer_state = optimizer.init(params_nn)
 
-    twopi = 2.0 * np.pi
-    nx = config.nx
-    ny = config.ny
-    coord = np.array([(i, j) for i in range(nx) for j in range(ny)])
-    xx, yy = coord[:, 0], coord[:, 1]
-    kx, ky = twopi / nx, twopi / ny
-    xx = xx.reshape((nx, ny)) * kx
-    yy = yy.reshape((nx, ny)) * ky
-
-    Re = 1600.0
-    vel_ref = 0.04*32/nx
-
-    visc = vel_ref * nx / Re
-    omega = 1.0 / (3.0 * visc + 0.5)
-
-    params_sim = prepare_simulation_parameters(config.nx, config.ny, xx, yy, vel_ref, omega)
-    simulation = TaylorGreenVortex(**params_sim)  
+    params_sim = prepare_simulation_parameters(config.nx, config.ny, config.omega)
+    simulation = Block(**params_sim)  
       
     params_nn = train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulation)
         
