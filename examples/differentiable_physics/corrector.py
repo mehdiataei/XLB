@@ -23,18 +23,18 @@ from typing import List
 # jax.config.update("jax_debug_nans", True)
 @dataclass
 class SimulationParameters:
-    nx_lr: int = 76
-    ny_lr: int = 20
+    nx_lr: int = 76 * 2
+    ny_lr: int = 20 * 2
     scaling_factor: int = 6
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
-    Re: List[float] = field(default_factory=lambda: [1000, 1100])
+    Re: List[float] = field(default_factory=lambda: [950, 1000, 1100])
     Re_test: float = 1050
     unrolling_steps: int = 100
     steps: int = 200
-    epochs: int = 20
+    epochs: int = 50
     correction_factor: float = 1.e-5
     learning_rate: float = 1e-3
     l1_coef: float = 0.0
