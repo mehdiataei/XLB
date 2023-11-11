@@ -157,14 +157,14 @@ def visualize_result(params_nn, initializer_nn, simulation):
         f, _ = simulation.step(f, i)
         rho, u = simulation.compute_macroscopic(f)
 
-        # if i % config.steps == 0 or i == config.steps * 2:
+        # if i % 1 == 0:
         #     fig, ax = plt.subplots(figsize=(10, 10))
         #     plt.axis('off') 
         #     im = ax.imshow(rho[:, :, 0], cmap='viridis')
 
-        #     divider = make_axes_locatable(ax)
-        #     cax = divider.append_axes('right', size='5%', pad=0.05)
-        #     fig.colorbar(im, cax=cax, orientation='vertical')
+        #     # divider = make_axes_locatable(ax)
+        #     # cax = divider.append_axes('right', size='5%', pad=0.05)
+        #     # fig.colorbar(im, cax=cax, orientation='vertical')
 
         #     plt.savefig(f'simulation_results_{str(i).zfill(4)}.png', dpi=600, bbox_inches='tight')
         #     plt.close(fig)
@@ -214,12 +214,12 @@ def main():
     params_sim = prepare_simulation_parameters(config.nx, config.ny, config.omega)
     simulation = Block(**params_sim)  
       
-    params_nn = train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulation)
+    # params_nn = train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulation)
         
-    print("Saving checkpoint...")
-    absolute_path = os.path.abspath('./')
-    checkpoints.save_checkpoint(absolute_path, params_nn, config.epochs, overwrite=True)
-    print("Checkpoint saved!")
+    # print("Saving checkpoint...")
+    # absolute_path = os.path.abspath('./')
+    # checkpoints.save_checkpoint(absolute_path, params_nn, config.epochs, overwrite=True)
+    # print("Checkpoint saved!")
 
     return params_nn, initializer_nn, simulation
 

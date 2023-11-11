@@ -25,22 +25,22 @@ from typing import List
 class SimulationParameters:
     nx_lr: int = 76
     ny_lr: int = 20
-    scaling_factor: int = 2
+    scaling_factor: int = 6
     nx_hr: int = nx_lr * scaling_factor
     ny_hr: int = ny_lr * scaling_factor
     precision: str = "f32/f32"
     prescribed_velocity: float = 0.05
     Re: List[float] = field(default_factory=lambda: [1000, 1100])
     Re_test: float = 1050
-    unrolling_steps: int = 50
+    unrolling_steps: int = 100
     steps: int = 200
     epochs: int = 20
-    correction_factor: float = 1.e-4
+    correction_factor: float = 1.e-5
     learning_rate: float = 1e-3
     l1_coef: float = 0.0
     load_from_checkpoint: bool = False
-    batch_size: int = 10
-    offset: int = 5000
+    batch_size: int = 20
+    offset: int = 10000
 
 config = SimulationParameters()
 
@@ -55,13 +55,15 @@ poiseuille_profile  = lambda x,x0,d,umax: np.maximum(0.,4.*umax/(d**2)*((x-x0)*d
 #         x = self._dense(x, 32)
 #         x = self._dense(x, 64)
 #         x = self._dense(x, 64)
+#         x = self._dense(x, 64)
+#         x = self._dense(x, 64)
 #         x = self._dense(x, 32)
 #         x = nn.Dense(features=np.prod(shape))(x)
 #         return x.reshape(shape)
 
 #     def _dense(self, x, features):
-#         x = nn.Dense(features=features, kernel_init=nn.initializers.he_normal(), bias_init=nn.initializers.zeros_init())(x)
-#         return nn.leaky_relu(x)
+#         x = nn.Dense(features=features, kernel_init=nn.initializers.he_normal(), bias_init=nn.initializers.ones_init())(x)
+#         return nn.relu(x)
 
 class ResidualBlock(nn.Module):
     filters: int
@@ -112,7 +114,6 @@ def prepare_simulation_parameters(nx, ny, Re):
         'nz': 0,
         'precision': config.precision
     }
-
 
 class Cylinder(BGKSim):
     def __init__(self, Re, corrector=None, **kwargs):
@@ -294,8 +295,9 @@ def update(batch_id, dataset, params, optimizer, optimizer_state, simulation_lr,
 def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
     error = 0
     batch_size = f_lr_init.shape[0]
+    f_lr_corrected = f_lr_init
     for i in range(config.unrolling_steps):
-        f_lr_corrected, _ = simulation_lr.step_vmapped(f_lr_init, 0, params)
+        f_lr_corrected, _ = simulation_lr.step_vmapped(f_lr_corrected, 0, params)
 
         u_lr_corrected = simulation_lr.compute_macroscopic_vmapped(f_lr_corrected)[1]
         u_hr = simulation_hr.compute_macroscopic_vmapped(f_hr[i + 1:i + 1 + batch_size, ...])[1]
@@ -303,8 +305,7 @@ def loss_fn(params, simulation_lr, simulation_hr, f_lr_init, f_hr):
         l2_y = jnp.mean((u_lr_corrected[..., 1] - u_hr[..., 1])**2)
         # l1_x = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 0] - u_hr[:, 1:-1, 1:-1, 0]))
         # l1_y = jnp.mean(jnp.abs(u_lr_corrected[:, 1:-1, 1:-1, 1] - u_hr[:, 1:-1, 1:-1, 1]))
-        error += l2_x + l2_y # + l1_x + l1_y
-
+        error += (l2_x + l2_y) # + l1_x + l1_y
     # l1_penalty = 0
     # for p in jax.tree_util.tree_leaves(params):
     #     l1_penalty += jnp.sum(jnp.abs(p))
