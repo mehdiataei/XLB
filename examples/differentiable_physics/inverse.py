@@ -155,7 +155,7 @@ def visualize_result(params_nn, initializer_nn, simulation):
     rho_init, u_init = simulation.compute_macroscopic(f)
     for i in range(config.steps):
         f, _ = simulation.step(f, i)
-        rho, u = simulation.compute_macroscopic(f)
+        # rho, u = simulation.compute_macroscopic(f)
 
         # if i % 1 == 0:
         #     fig, ax = plt.subplots(figsize=(10, 10))
@@ -214,12 +214,12 @@ def main():
     params_sim = prepare_simulation_parameters(config.nx, config.ny, config.omega)
     simulation = Block(**params_sim)  
       
-    # params_nn = train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulation)
+    params_nn = train_model(params_nn, initializer_nn, optimizer, optimizer_state, simulation)
         
-    # print("Saving checkpoint...")
-    # absolute_path = os.path.abspath('./')
-    # checkpoints.save_checkpoint(absolute_path, params_nn, config.epochs, overwrite=True)
-    # print("Checkpoint saved!")
+    print("Saving checkpoint...")
+    absolute_path = os.path.abspath('./')
+    checkpoints.save_checkpoint(absolute_path, params_nn, config.epochs, overwrite=True)
+    print("Checkpoint saved!")
 
     return params_nn, initializer_nn, simulation
 
