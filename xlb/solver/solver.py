@@ -4,6 +4,8 @@ from xlb.compute_backends import ComputeBackends
 from xlb.operator.boundary_condition import ImplementationStep
 from xlb.global_config import GlobalConfig
 from xlb.operator import Operator
+from xlb.grid import Parallelize
+from functools import partial
 
 
 class Solver(Operator):
@@ -35,3 +37,6 @@ class Solver(Operator):
                 self.stream_boundary_conditions[bc_id] = bc
             else:
                 raise ValueError("Boundary condition step not recognized")
+
+    def _step(self, f):
+        pass

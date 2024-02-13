@@ -44,6 +44,7 @@ start_time = time.time()
 for step in range(num_steps):
     f = solver_step_compiled(f, timestep=step)
 
+f.block_until_ready()
 end_time = time.time()
 total_lattice_updates = cube_edge**3 * num_steps
 total_time_seconds = end_time - start_time

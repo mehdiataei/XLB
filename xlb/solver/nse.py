@@ -12,7 +12,7 @@ from xlb.operator.stream import Stream
 from xlb.operator.macroscopic import Macroscopic
 from xlb.solver.solver import Solver
 from xlb.operator import Operator
-
+from xlb.grid import Parallelize
 
 class IncompressibleNavierStokes(Solver):
     def __init__(
@@ -56,9 +56,8 @@ class IncompressibleNavierStokes(Solver):
             velocity_set=self.velocity_set, compute_backend=self.compute_backend
         )
 
-    @Operator.register_backend(ComputeBackends.JAX)
-    @partial(jit, static_argnums=(0,))
-    def step(self, f, timestep):
+
+    def _step(self, f, timestep):
         """
         Perform a single step of the lattice boltzmann method
         """
@@ -108,3 +107,8 @@ class IncompressibleNavierStokes(Solver):
         f = self.precision_policy.cast_to_store(f_post_streaming)
 
         return f
+
+    @Operator.register_backend(ComputeBackends.JAX)
+    @partial(jit, static_argnums=(0,))
+    def step(self, f, timestep):
+        return Parallelize(self._step, self.grid, self.velocity_set)(f, timestep)
