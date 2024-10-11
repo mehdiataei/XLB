@@ -133,6 +133,7 @@ class MeshBoundaryMasker(Operator):
         mesh = wp.Mesh(
             points=wp.array(mesh_vertices, dtype=wp.vec3),
             indices=wp.array(mesh_indices, dtype=int),
+            support_winding_number=True,
         )
 
         # Launch the warp kernel

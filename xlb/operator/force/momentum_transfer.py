@@ -129,8 +129,11 @@ class MomentumTransfer(Operator):
                 if _missing_mask[_zero_index] == wp.uint8(0):
                     is_edge = wp.bool(True)
 
-            # If the boundary is an edge then add the momentum transfer
             m = _u_vec()
+            for d in range(self.velocity_set.d):
+                m[d] = self.compute_dtype(0.0)
+
+            # If the boundary is an edge then add the momentum transfer
             if is_edge:
                 # Get the distribution function
                 f_post_collision = _f_vec()
@@ -143,17 +146,14 @@ class MomentumTransfer(Operator):
                 f_post_stream = self.no_slip_bc_instance.warp_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream)
 
                 # Compute the momentum transfer
-                for d in range(self.velocity_set.d):
-                    m[d] = self.compute_dtype(0.0)
-                    for l in range(self.velocity_set.q):
-                        if _missing_mask[l] == wp.uint8(1):
-                            phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
-                            if _c[d, _opp_indices[l]] == 1:
-                                m[d] += phi
-                            elif _c[d, _opp_indices[l]] == -1:
-                                m[d] -= phi
+                for l in range(self.velocity_set.q):
+                    if _missing_mask[l] == wp.uint8(1):
+                        phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
+                        for d in range(wp.static(self.velocity_set.d)):
+                            m[d] += phi * self.compute_dtype(_c[d, _opp_indices[l]])
 
-            wp.atomic_add(force, 0, m)
+            for d in range(self.velocity_set.d):
+                wp.atomic_add(force, d, m[d])
 
         # Construct the warp kernel
         @wp.kernel
@@ -184,8 +184,11 @@ class MomentumTransfer(Operator):
                 if _missing_mask[_zero_index] == wp.uint8(0):
                     is_edge = wp.bool(True)
 
-            # If the boundary is an edge then add the momentum transfer
             m = _u_vec()
+            for d in range(self.velocity_set.d):
+                m[d] = self.compute_dtype(0.0)
+
+            # If the boundary is an edge then add the momentum transfer
             if is_edge:
                 # Get the distribution function
                 f_post_collision = _f_vec()
@@ -198,17 +201,15 @@ class MomentumTransfer(Operator):
                 f_post_stream = self.no_slip_bc_instance.warp_functional(index, timestep, _missing_mask, f_0, f_1, f_post_collision, f_post_stream)
 
                 # Compute the momentum transfer
-                for d in range(self.velocity_set.d):
-                    m[d] = self.compute_dtype(0.0)
-                    for l in range(self.velocity_set.q):
-                        if _missing_mask[l] == wp.uint8(1):
-                            phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
-                            if _c[d, _opp_indices[l]] == 1:
-                                m[d] += phi
-                            elif _c[d, _opp_indices[l]] == -1:
-                                m[d] -= phi
+                for l in range(self.velocity_set.q):
+                    if _missing_mask[l] == wp.uint8(1):
+                        phi = f_post_collision[_opp_indices[l]] + f_post_stream[l]
+                        for d in range(wp.static(self.velocity_set.d)):
+                            m[d] += phi * self.compute_dtype(_c[d, _opp_indices[l]])
 
-            wp.atomic_add(force, 0, m)
+            # Perform per-component atomic addition
+            for d in range(self.velocity_set.d):
+                wp.atomic_add(force, d, m[d])
 
         # Return the correct kernel
         kernel = kernel3d if self.velocity_set.d == 3 else kernel2d
@@ -218,13 +219,11 @@ class MomentumTransfer(Operator):
     @Operator.register_backend(ComputeBackend.WARP)
     def warp_implementation(self, f_0, f_1, bc_mask, missing_mask):
         # Allocate the force vector (the total integral value will be computed)
-        _u_vec = wp.vec(self.velocity_set.d, dtype=self.compute_dtype)
-        force = wp.zeros((1), dtype=_u_vec)
-
+        force = wp.zeros((self.velocity_set.d,), dtype=self.compute_dtype)
         # Launch the warp kernel
         wp.launch(
             self.warp_kernel,
             inputs=[f_0, f_1, bc_mask, missing_mask, force],
             dim=f_0.shape[1:],
         )
-        return force.numpy()[0]
+        return force
