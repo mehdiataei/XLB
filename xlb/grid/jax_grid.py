@@ -40,6 +40,7 @@ class JaxGrid(Grid):
         cardinality: int,
         dtype: Literal[Precision.FP32, Precision.FP64, Precision.FP16, Precision.BOOL] = None,
         fill_value=None,
+        requires_grad=False,
     ):
         sharding_dim = self.shape[0] // self.nDevices
         device_shape = (cardinality, sharding_dim, *self.shape[1:])

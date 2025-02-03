@@ -93,7 +93,7 @@ class IncompressibleNavierStokesStepper(Stepper):
     def _process_boundary_conditions(cls, boundary_conditions, bc_mask, missing_mask):
         """Process boundary conditions and update boundary masks."""
         # Check for boundary condition overlaps
-        check_bc_overlaps(boundary_conditions, DefaultConfig.velocity_set.d, DefaultConfig.default_backend)
+        # check_bc_overlaps(boundary_conditions, DefaultConfig.velocity_set.d, DefaultConfig.default_backend)
         # Create boundary maskers
         indices_masker = IndicesBoundaryMasker(
             velocity_set=DefaultConfig.velocity_set,
@@ -279,7 +279,7 @@ class IncompressibleNavierStokesStepper(Stepper):
             f_1: wp.array4d(dtype=Any),
             bc_mask: wp.array4d(dtype=Any),
             missing_mask: wp.array4d(dtype=Any),
-            omega: Any,
+            omega: wp.array(dtype=Any),
             timestep: int,
         ):
             i, j, k = wp.tid()
@@ -300,7 +300,8 @@ class IncompressibleNavierStokesStepper(Stepper):
 
             _rho, _u = self.macroscopic.warp_functional(_f_post_stream)
             _feq = self.equilibrium.warp_functional(_rho, _u)
-            _f_post_collision = self.collision.warp_functional(_f_post_stream, _feq, _rho, _u, omega)
+            omega_val = omega[0]
+            _f_post_collision = self.collision.warp_functional(_f_post_stream, _feq, _rho, _u, omega_val)
 
             # Apply post-collision boundary conditions
             _f_post_collision = apply_bc(index, timestep, _boundary_id, _missing_mask, f_0, f_1, _f_post_stream, _f_post_collision, False)

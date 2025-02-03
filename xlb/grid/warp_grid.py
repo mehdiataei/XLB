@@ -19,6 +19,7 @@ class WarpGrid(Grid):
         cardinality: int,
         dtype: Literal[Precision.FP32, Precision.FP64, Precision.FP16] = None,
         fill_value=None,
+        requires_grad=False,
     ):
         dtype = dtype.wp_dtype if dtype else DefaultConfig.default_precision_policy.store_precision.wp_dtype
 
@@ -26,7 +27,7 @@ class WarpGrid(Grid):
         shape = (cardinality,) + (self.shape if len(self.shape) != 2 else self.shape + (1,))
 
         if fill_value is None:
-            f = wp.zeros(shape, dtype=dtype)
+            f = wp.zeros(shape, dtype=dtype, requires_grad=requires_grad)
         else:
-            f = wp.full(shape, fill_value, dtype=dtype)
+            f = wp.full(shape, fill_value, dtype=dtype, requires_grad=requires_grad)
         return f
