@@ -118,23 +118,9 @@ def load_and_prepare_meshes_car(grid_shape, stl_dir=None):
     print(f"Body width: {scaled_body_width:.1f} (target: {target_body_width:.1f})")
     print(f"Total car width (body + wheels): {max_y - min_y:.1f}")
 
-    def estimate_wheel_center_and_axis(mesh):
-        vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    def estimate_wheel_center(mesh):
         center = 0.5 * (mesh.bounds[0] + mesh.bounds[1])
-        centered = vertices - center
-        if centered.shape[0] < 3:
-            return center.astype(np.float32), np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        covariance = centered.T @ centered / float(max(centered.shape[0] - 1, 1))
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-        axis = eigenvectors[:, int(np.argmin(eigenvalues))]
-        axis_norm = np.linalg.norm(axis)
-        if axis_norm < 1e-8:
-            axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        else:
-            axis = axis / axis_norm
-        if axis[1] < 0.0:
-            axis = -axis
-        return center.astype(np.float32), axis.astype(np.float32)
+        return center.astype(np.float32)
 
     def apply_transform(mesh):
         mesh.apply_scale(scale_factor)
@@ -155,11 +141,9 @@ def load_and_prepare_meshes_car(grid_shape, stl_dir=None):
     apply_transform(bl_mesh)
 
     wheel_centers = []
-    wheel_axes = []
     for wheel_mesh in [fr_mesh, fl_mesh, br_mesh, bl_mesh]:
-        center, axis = estimate_wheel_center_and_axis(wheel_mesh)
+        center = estimate_wheel_center(wheel_mesh)
         wheel_centers.append(center)
-        wheel_axes.append(axis)
 
     body_v_wp, body_a_wp, body_faces = prepare_immersed_boundary(body_mesh, max_lbm_length=Ny / 2.0)
     fr_v_wp, fr_a_wp, fr_faces = prepare_immersed_boundary(fr_mesh, max_lbm_length=Ny / 2.0)
@@ -225,7 +209,6 @@ def load_and_prepare_meshes_car(grid_shape, stl_dir=None):
         "faces_np": faces_np,
         "wheel_ranges": wheel_ranges,
         "wheel_centers": wheel_centers,
-        "wheel_axes": wheel_axes,
         "num_body_vertices": num_body_vertices,
         "num_wheel_vertices": num_wheel_vertices,
         "body_faces_np": body_faces_np,
@@ -338,16 +321,7 @@ def rotate_wheels(
         _wheel_centers_y[wheel_id],
         _wheel_centers_z[wheel_id],
     )
-    axis = wp.vec3(
-        _wheel_axes_x[wheel_id],
-        _wheel_axes_y[wheel_id],
-        _wheel_axes_z[wheel_id],
-    )
-    axis_norm = wp.length(axis)
-    if axis_norm > 1e-8:
-        axis = axis / axis_norm
-    else:
-        axis = wp.vec3(0.0, 1.0, 0.0)
+    axis = wp.vec3(0.0, 1.0, 0.0)
 
     rel_pos = vertices[idx] - center
     theta = _wheel_speed
@@ -576,7 +550,6 @@ areas_wp = mesh_data["areas_wp"]
 faces_np = mesh_data["faces_np"]
 wheel_ranges = mesh_data["wheel_ranges"]
 wheel_centers = mesh_data["wheel_centers"]
-wheel_axes = mesh_data["wheel_axes"]
 num_body_vertices = mesh_data["num_body_vertices"]
 num_wheel_vertices = mesh_data["num_wheel_vertices"]
 body_faces_np = mesh_data["body_faces_np"]
@@ -600,18 +573,12 @@ ends_list = [rng[1] for rng in wheel_ranges]
 cx_list = [c[0] for c in wheel_centers]
 cy_list = [c[1] for c in wheel_centers]
 cz_list = [c[2] for c in wheel_centers]
-ax_list = [a[0] for a in wheel_axes]
-ay_list = [a[1] for a in wheel_axes]
-az_list = [a[2] for a in wheel_axes]
 
 _wheel_starts = wp.constant(wp.vec(len(starts_list), dtype=int)(starts_list))
 _wheel_ends = wp.constant(wp.vec(len(ends_list), dtype=int)(ends_list))
 _wheel_centers_x = wp.constant(wp.vec(len(cx_list), dtype=float)(cx_list))
 _wheel_centers_y = wp.constant(wp.vec(len(cy_list), dtype=float)(cy_list))
 _wheel_centers_z = wp.constant(wp.vec(len(cz_list), dtype=float)(cz_list))
-_wheel_axes_x = wp.constant(wp.vec(len(ax_list), dtype=float)(ax_list))
-_wheel_axes_y = wp.constant(wp.vec(len(ay_list), dtype=float)(ay_list))
-_wheel_axes_z = wp.constant(wp.vec(len(az_list), dtype=float)(az_list))
 
 bc_list = setup_boundary_conditions(grid, velocity_set, precision_policy, grid_shape, u_max)
 stepper = setup_stepper(grid, bc_list, omega)
