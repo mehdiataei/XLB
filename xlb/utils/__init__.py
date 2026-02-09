@@ -2,6 +2,7 @@ from .utils import (
     downsample_field,
     save_image,
     save_fields_vtk,
+    save_velocity_components_nvdb,
     save_BCs_vtk,
     rotate_geometry,
     voxelize_stl,

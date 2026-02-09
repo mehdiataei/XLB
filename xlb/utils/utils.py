@@ -145,6 +145,43 @@ def save_fields_vtk(fields, timestep, output_dir=".", prefix="fields"):
     print(f"Saved {output_filename} in {time() - start:.6f} seconds.")
 
 
+def save_velocity_components_nvdb(
+    velocity_field,
+    timestep,
+    output_dir=".",
+    prefix="velocity",
+    device="cuda:0",
+    codec="zip",
+    clip_lower=None,
+    clip_upper=None,
+):
+    velocity_np = np.asarray(velocity_field)
+    if velocity_np.ndim != 4 or velocity_np.shape[0] != 3:
+        raise ValueError("velocity_field must have shape (3, nx, ny, nz)")
+    if codec not in {"none", "zip", "blosc"}:
+        raise ValueError("codec must be one of: 'none', 'zip', 'blosc'")
+    velocity_np = _slice_velocity_field(velocity_np, clip_lower, clip_upper)
+    if min(velocity_np.shape[1:]) <= 0:
+        raise ValueError("Clipping produced an empty velocity field")
+    origin = _normalize_clip_values(clip_lower)
+    min_world = tuple(float(v) for v in origin)
+    os.makedirs(output_dir, exist_ok=True)
+    component_names = ("u_x", "u_y", "u_z")
+    for component_index, component_name in enumerate(component_names):
+        component_field = np.ascontiguousarray(velocity_np[component_index].astype(np.float32, copy=False))
+        volume = wp.Volume.load_from_numpy(
+            component_field,
+            min_world=min_world,
+            voxel_size=1.0,
+            bg_value=0.0,
+            device=device,
+        )
+        output_filename = os.path.join(output_dir, f"{prefix}_{component_name}_{timestep:07d}.nvdb")
+        volume.save_to_nvdb(output_filename, codec=codec)
+        del volume
+    print(f"Saved NanoVDB velocity components for timestep {timestep} to {output_dir}")
+
+
 def save_BCs_vtk(timestep, BCs, gridInfo, output_dir="."):
     """
     Save boundary conditions as VTK format to the specified directory.
