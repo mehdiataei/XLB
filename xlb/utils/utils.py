@@ -154,6 +154,10 @@ def save_velocity_components_nvdb(
     codec="zip",
     clip_lower=None,
     clip_upper=None,
+    voxel_size=1.0,
+    min_world=None,
+    flip_axes=None,
+    value_scale=1.0,
 ):
     velocity_np = np.asarray(velocity_field)
     if velocity_np.ndim != 4 or velocity_np.shape[0] != 3:
@@ -163,8 +167,20 @@ def save_velocity_components_nvdb(
     velocity_np = _slice_velocity_field(velocity_np, clip_lower, clip_upper)
     if min(velocity_np.shape[1:]) <= 0:
         raise ValueError("Clipping produced an empty velocity field")
-    origin = _normalize_clip_values(clip_lower)
-    min_world = tuple(float(v) for v in origin)
+    if flip_axes is not None:
+        # Flip spatial axes (offset by 1 for the leading component dimension)
+        flip_dims = tuple(i + 1 for i, flip in enumerate(flip_axes) if flip)
+        if flip_dims:
+            velocity_np = np.flip(velocity_np, axis=flip_dims).copy()
+        # Negate velocity components whose axes are flipped
+        for i, flip in enumerate(flip_axes):
+            if flip:
+                velocity_np[i] *= -1
+    if value_scale != 1.0:
+        velocity_np = velocity_np * value_scale
+    if min_world is None:
+        origin = _normalize_clip_values(clip_lower)
+        min_world = tuple(float(v) * voxel_size for v in origin)
     os.makedirs(output_dir, exist_ok=True)
     component_names = ("u_x", "u_y", "u_z")
     for component_index, component_name in enumerate(component_names):
@@ -172,7 +188,7 @@ def save_velocity_components_nvdb(
         volume = wp.Volume.load_from_numpy(
             component_field,
             min_world=min_world,
-            voxel_size=1.0,
+            voxel_size=voxel_size,
             bg_value=0.0,
             device=device,
         )
@@ -180,6 +196,220 @@ def save_velocity_components_nvdb(
         volume.save_to_nvdb(output_filename, codec=codec)
         del volume
     print(f"Saved NanoVDB velocity components for timestep {timestep} to {output_dir}")
+
+
+def save_vorticity_nvdb(
+    f_current,
+    bc_mask,
+    grid_shape,
+    vorticity_operator,
+    precision_policy,
+    timestep,
+    output_dir=".",
+    prefix="vorticity",
+    device="cuda:0",
+    codec="zip",
+    clip_lower=None,
+    clip_upper=None,
+    voxel_size=1.0,
+    min_world=None,
+    flip_axes=None,
+    value_scale=1.0,
+):
+    """
+    Compute the vorticity field from the distribution function and save
+    the vorticity magnitude as a NanoVDB volume.
+
+    Parameters
+    ----------
+    f_current : warp array
+        The current distribution function.
+    bc_mask : warp array
+        Boundary condition mask.
+    grid_shape : tuple
+        Shape of the simulation grid (Nx, Ny, Nz).
+    vorticity_operator : Vorticity
+        The vorticity postprocessing operator.
+    precision_policy : PrecisionPolicy
+        The precision policy.
+    timestep : int
+        Current simulation timestep.
+    output_dir : str
+        Output directory for the NanoVDB file.
+    prefix : str
+        Filename prefix.
+    device : str
+        Device to use for computation.
+    codec : str
+        Compression codec ('none', 'zip', or 'blosc').
+    clip_lower : tuple, optional
+        Lower clipping bounds (cells to remove from each axis start).
+    clip_upper : tuple, optional
+        Upper clipping bounds (cells to remove from each axis end).
+    voxel_size : float
+        Physical size of each voxel in world units.
+    min_world : tuple, optional
+        World-space position (x, y, z) of the first voxel of the output field.
+        If None, defaults to clip_lower * voxel_size.
+    flip_axes : tuple of bool, optional
+        Which spatial axes to reverse, e.g. (True, True, False) to flip x and y.
+    """
+    from xlb.compute_backend import ComputeBackend
+    from xlb.operator.macroscopic import Macroscopic
+    import xlb
+
+    if codec not in {"none", "zip", "blosc"}:
+        raise ValueError("codec must be one of: 'none', 'zip', 'blosc'")
+    clip_lower = _normalize_clip_values(clip_lower)
+    clip_upper = _normalize_clip_values(clip_upper)
+    if min_world is None:
+        min_world = tuple(float(v) * voxel_size for v in clip_lower)
+    f_current_dev = _clone_to_device(f_current, device)
+    bc_mask_dev = _clone_to_device(bc_mask, device)
+    with wp.ScopedDevice(device):
+        velocity_set = xlb.velocity_set.D3Q27(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
+        macro_wp = Macroscopic(
+            compute_backend=ComputeBackend.WARP,
+            precision_policy=precision_policy,
+            velocity_set=velocity_set,
+        )
+        rho = wp.zeros((1, *grid_shape), dtype=wp.float32, device=device)
+        u = wp.zeros((3, *grid_shape), dtype=wp.float32, device=device)
+        rho, u = macro_wp(f_current_dev, rho, u)
+        u = u[:, 1:-1, 1:-1, 1:-1]  # Strip ghost/boundary cells
+        u = _slice_velocity_field(u, clip_lower, clip_upper)
+        vorticity = wp.zeros((3, *u.shape[1:]), dtype=wp.float32, device=device)
+        vorticity_magnitude = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
+        vorticity, vorticity_magnitude = vorticity_operator(u, bc_mask_dev, vorticity, vorticity_magnitude)
+        vort_mag_np = vorticity_magnitude.numpy()[0]
+    if flip_axes is not None:
+        flip_dims = tuple(i for i, flip in enumerate(flip_axes) if flip)
+        if flip_dims:
+            vort_mag_np = np.flip(vort_mag_np, axis=flip_dims).copy()
+    if value_scale != 1.0:
+        vort_mag_np = vort_mag_np * value_scale
+    os.makedirs(output_dir, exist_ok=True)
+    field_np = np.ascontiguousarray(vort_mag_np.astype(np.float32, copy=False))
+    volume = wp.Volume.load_from_numpy(
+        field_np,
+        min_world=min_world,
+        voxel_size=voxel_size,
+        bg_value=0.0,
+        device=device,
+    )
+    output_filename = os.path.join(output_dir, f"{prefix}_magnitude_{timestep:07d}.nvdb")
+    volume.save_to_nvdb(output_filename, codec=codec)
+    del volume
+    print(f"Saved NanoVDB vorticity magnitude for timestep {timestep} to {output_dir}")
+
+
+def save_q_criterion_nvdb(
+    f_current,
+    bc_mask,
+    grid_shape,
+    q_criterion_operator,
+    precision_policy,
+    timestep,
+    output_dir=".",
+    prefix="q_criterion",
+    device="cuda:0",
+    codec="zip",
+    clip_lower=None,
+    clip_upper=None,
+    voxel_size=1.0,
+    min_world=None,
+    flip_axes=None,
+    value_scale=1.0,
+):
+    """
+    Compute the Q-criterion field from the distribution function and save
+    it as a NanoVDB volume.
+
+    Parameters
+    ----------
+    f_current : warp array
+        The current distribution function.
+    bc_mask : warp array
+        Boundary condition mask.
+    grid_shape : tuple
+        Shape of the simulation grid (Nx, Ny, Nz).
+    q_criterion_operator : QCriterion
+        The Q-criterion postprocessing operator.
+    precision_policy : PrecisionPolicy
+        The precision policy.
+    timestep : int
+        Current simulation timestep.
+    output_dir : str
+        Output directory for the NanoVDB file.
+    prefix : str
+        Filename prefix.
+    device : str
+        Device to use for computation.
+    codec : str
+        Compression codec ('none', 'zip', or 'blosc').
+    clip_lower : tuple, optional
+        Lower clipping bounds (cells to remove from each axis start).
+    clip_upper : tuple, optional
+        Upper clipping bounds (cells to remove from each axis end).
+    voxel_size : float
+        Physical size of each voxel in world units.
+    min_world : tuple, optional
+        World-space position (x, y, z) of the first voxel of the output field.
+        If None, defaults to clip_lower * voxel_size.
+    flip_axes : tuple of bool, optional
+        Which spatial axes to reverse, e.g. (True, True, False) to flip x and y.
+    """
+    from xlb.compute_backend import ComputeBackend
+    from xlb.operator.macroscopic import Macroscopic
+    import xlb
+
+    if codec not in {"none", "zip", "blosc"}:
+        raise ValueError("codec must be one of: 'none', 'zip', 'blosc'")
+    clip_lower = _normalize_clip_values(clip_lower)
+    clip_upper = _normalize_clip_values(clip_upper)
+    if min_world is None:
+        min_world = tuple(float(v) * voxel_size for v in clip_lower)
+    f_current_dev = _clone_to_device(f_current, device)
+    bc_mask_dev = _clone_to_device(bc_mask, device)
+    with wp.ScopedDevice(device):
+        velocity_set = xlb.velocity_set.D3Q27(
+            precision_policy=precision_policy, compute_backend=ComputeBackend.WARP
+        )
+        macro_wp = Macroscopic(
+            compute_backend=ComputeBackend.WARP,
+            precision_policy=precision_policy,
+            velocity_set=velocity_set,
+        )
+        rho = wp.zeros((1, *grid_shape), dtype=wp.float32, device=device)
+        u = wp.zeros((3, *grid_shape), dtype=wp.float32, device=device)
+        rho, u = macro_wp(f_current_dev, rho, u)
+        u = u[:, 1:-1, 1:-1, 1:-1]  # Strip ghost/boundary cells
+        u = _slice_velocity_field(u, clip_lower, clip_upper)
+        norm_mu = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
+        q_field = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
+        norm_mu, q_field = q_criterion_operator(u, bc_mask_dev, norm_mu, q_field)
+        q_np = q_field.numpy()[0]
+    if flip_axes is not None:
+        flip_dims = tuple(i for i, flip in enumerate(flip_axes) if flip)
+        if flip_dims:
+            q_np = np.flip(q_np, axis=flip_dims).copy()
+    if value_scale != 1.0:
+        q_np = q_np * value_scale
+    os.makedirs(output_dir, exist_ok=True)
+    field_np = np.ascontiguousarray(q_np.astype(np.float32, copy=False))
+    volume = wp.Volume.load_from_numpy(
+        field_np,
+        min_world=min_world,
+        voxel_size=voxel_size,
+        bg_value=0.0,
+        device=device,
+    )
+    output_filename = os.path.join(output_dir, f"{prefix}_{timestep:07d}.nvdb")
+    volume.save_to_nvdb(output_filename, codec=codec)
+    del volume
+    print(f"Saved NanoVDB Q-criterion for timestep {timestep} to {output_dir}")
 
 
 def save_BCs_vtk(timestep, BCs, gridInfo, output_dir="."):

@@ -1,8 +1,6 @@
 import os
 import xlb
 import trimesh
-import time
-from tqdm import tqdm
 from xlb.compute_backend import ComputeBackend
 from xlb.precision_policy import PrecisionPolicy
 from xlb.operator.stepper import IBMStepper
@@ -13,19 +11,16 @@ from xlb.operator.boundary_condition import (
 )
 from xlb.operator.macroscopic import Macroscopic
 from xlb.utils import (
-    save_fields_vtk,
     save_velocity_components_nvdb,
+    save_vorticity_nvdb,
+    save_q_criterion_nvdb,
     save_image,
-    save_usd_vorticity,
-    save_usd_q_criterion,
-    update_usd_lagrangian_parts,
     plot_object_placement,
 )
 import warp as wp
 import numpy as np
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from xlb.helper.ibm_helper import prepare_immersed_boundary
 from xlb.grid import grid_factory
 from pxr import Usd, UsdGeom, Sdf, Vt
@@ -214,6 +209,8 @@ def load_and_prepare_meshes_car(grid_shape, stl_dir=None):
         "body_faces_np": body_faces_np,
         "wheels_faces_np": wheels_faces_np,
         "frontal_area": frontal_area,
+        "scale_factor": scale_factor,
+        "shift": (shift_x, shift_y, shift_z),
     }
 
 
@@ -373,9 +370,7 @@ def post_process(
     slice_idy = grid_shape[1] // 2
     save_image(fields["u_magnitude"][:, slice_idy, :], timestep=i)
     # save_fields_vtk(fields, i)
-    if save_velocity_nanovdb and (
-        i == num_steps - 1 or (nanovdb_export_interval > 0 and i > 0 and i % nanovdb_export_interval == 0)
-    ):
+    if save_velocity_nanovdb:
         save_velocity_components_nvdb(
             velocity_field=u,
             timestep=i,
@@ -385,6 +380,10 @@ def post_process(
             codec=nanovdb_codec,
             clip_lower=nanovdb_clip_lower,
             clip_upper=nanovdb_clip_upper,
+            voxel_size=nanovdb_voxel_size,
+            min_world=nanovdb_min_world,
+            flip_axes=nanovdb_flip_axes,
+            value_scale=nanovdb_velocity_scale,
         )
 
     # Calculate and store drag coefficient if forces are available
@@ -395,63 +394,43 @@ def post_process(
         # Save current Cd values to file
         save_drag_coefficient(cd_values, "drag_coefficient.csv")
 
-    save_usd_vorticity(
-        timestep=i,
-        post_process_interval=post_process_interval,
-        bc_mask=bc_mask,
-        f_current=f_current,
-        grid_shape=grid_shape,
-        usd_mesh=usd_mesh_vorticity,
-        vorticity_operator=vorticity_operator,
-        precision_policy=precision_policy,
-        vorticity_threshold=1e-2,
-        usd_stage=usd_stage,
-        device="cuda:1",
-        clip_lower=(20, 20, 0),
-        clip_upper=(20, 20, 20),
-    )
+    if save_vorticity_nanovdb:
+        save_vorticity_nvdb(
+            f_current=f_current,
+            bc_mask=bc_mask,
+            grid_shape=grid_shape,
+            vorticity_operator=vorticity_operator,
+            precision_policy=precision_policy,
+            timestep=i,
+            output_dir=nanovdb_vorticity_output_directory,
+            device=nanovdb_device,
+            codec=nanovdb_codec,
+            clip_lower=nanovdb_clip_lower,
+            clip_upper=nanovdb_clip_upper,
+            voxel_size=nanovdb_voxel_size,
+            min_world=nanovdb_min_world,
+            flip_axes=nanovdb_flip_axes,
+            value_scale=nanovdb_vorticity_scale,
+        )
 
-    save_usd_q_criterion(
-        timestep=i,
-        post_process_interval=post_process_interval,
-        bc_mask=bc_mask,
-        f_current=f_current,
-        grid_shape=grid_shape,
-        usd_mesh=usd_mesh_q_criterion,
-        q_criterion_operator=q_criterion_operator,
-        precision_policy=precision_policy,
-        q_threshold=5e-6,
-        usd_stage=usd_stage,
-        device="cuda:1",
-        clip_lower=(20, 20, 0),
-        clip_upper=(20, 20, 20),
-        color_range=(0.0, 0.1),
-    )
-
-    update_usd_lagrangian_parts(
-        timestep=i,
-        post_process_interval=post_process_interval,
-        vertices_wp=vertices_wp,
-        parts=[
-            {
-                "start": 0,
-                "end": num_body_vertices,
-                "faces": body_faces_np,
-                "usd_mesh": usd_car_body,
-                "colorize": True,
-            },
-            {
-                "start": num_body_vertices,
-                "end": vertices_wp.shape[0],
-                "faces": wheels_faces_np,
-                "usd_mesh": usd_car_wheels,
-                "colorize": True,
-            },
-        ],
-        vertex_offset=(20.0, 20.0, 0.0),
-        lag_forces=lag_forces,
-        device="cuda:1",
-    )
+    if save_q_criterion_nanovdb:
+        save_q_criterion_nvdb(
+            f_current=f_current,
+            bc_mask=bc_mask,
+            grid_shape=grid_shape,
+            q_criterion_operator=q_criterion_operator,
+            precision_policy=precision_policy,
+            timestep=i,
+            output_dir=nanovdb_q_criterion_output_directory,
+            device=nanovdb_device,
+            codec=nanovdb_codec,
+            clip_lower=nanovdb_clip_lower,
+            clip_upper=nanovdb_clip_upper,
+            voxel_size=nanovdb_voxel_size,
+            min_world=nanovdb_min_world,
+            flip_axes=nanovdb_flip_axes,
+            value_scale=nanovdb_q_criterion_scale,
+        )
 
 
 def save_drag_coefficient(cd_values, filename):
@@ -487,8 +466,9 @@ def save_drag_coefficient(cd_values, filename):
 
 # grid_shape = (800, 400, 200)
 # grid_shape = (1000, 500, 300)
-grid_shape = (256, 100, 100)
+grid_shape = (256, 100, 70)
 u_max = 0.02
+u_max_physical = 30.0  # m/s, reference wind tunnel speed
 iter_per_flow_passes = grid_shape[0] / u_max
 num_steps = int(iter_per_flow_passes * 2.0)
 post_process_interval = 200
@@ -496,13 +476,13 @@ print_interval = 100
 wheel_rotation_speed = -0.001
 num_wheels = 4
 save_velocity_nanovdb = True
-nanovdb_export_interval = 100
+save_vorticity_nanovdb = True
+save_q_criterion_nanovdb = True
 nanovdb_codec = "zip"
 nanovdb_prefix = "velocity"
 nanovdb_device = "cuda:1"
-nanovdb_clip_lower = (20, 20, 0)
-nanovdb_clip_upper = (20, 20, 20)
-
+nanovdb_clip_lower = (0, 0, 0)
+nanovdb_clip_upper = (0, 0, 0)
 Re = 1e6
 clength = grid_shape[0] - 1
 visc = u_max * clength / Re
@@ -520,23 +500,23 @@ print(f"  Omega: {omega}")
 print(f"  Backend: {compute_backend}")
 print(f"  Velocity set: {velocity_set}")
 print(f"  Precision policy: {precision_policy}")
-print(f"  Inlet velocity: {u_max}")
+print(f"  Inlet velocity (lattice): {u_max}")
+print(f"  Physical wind speed: {u_max_physical} m/s")
 print(f"  Reynolds number: {Re}")
 print(f"  Max steps: {num_steps}")
-print(f"  NanoVDB velocity export: {save_velocity_nanovdb}")
-if save_velocity_nanovdb:
-    if nanovdb_export_interval > 0:
-        print(f"  NanoVDB export interval: {nanovdb_export_interval}")
-    else:
-        print("  NanoVDB export interval: final step only")
+print(f"  Post-process interval: {post_process_interval}")
 
 # Initialize list to store drag coefficient values
 cd_values = []
 
 usd_output_directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "usd_output_nvidia")
 os.makedirs(usd_output_directory, exist_ok=True)
-nanovdb_output_directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "nvdb_output_nvidia")
+nanovdb_output_directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "nvdb_output_velocity")
 os.makedirs(nanovdb_output_directory, exist_ok=True)
+nanovdb_vorticity_output_directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "nvdb_output_vorticity")
+os.makedirs(nanovdb_vorticity_output_directory, exist_ok=True)
+nanovdb_q_criterion_output_directory = os.path.join(os.path.abspath(os.path.dirname(__file__)), "nvdb_output_q_criterion")
+os.makedirs(nanovdb_q_criterion_output_directory, exist_ok=True)
 usd_file = os.path.join(usd_output_directory, "car_output_nvidia.usd")
 usd_stage = Usd.Stage.CreateNew(usd_file)
 usd_mesh_vorticity = UsdGeom.Mesh.Define(usd_stage, "/World/Vorticity")
@@ -555,6 +535,31 @@ num_wheel_vertices = mesh_data["num_wheel_vertices"]
 body_faces_np = mesh_data["body_faces_np"]
 wheels_faces_np = mesh_data["wheels_faces_np"]
 frontal_area = mesh_data["frontal_area"]
+nanovdb_voxel_size = 1.0 / mesh_data["scale_factor"]
+mesh_shift = mesh_data["shift"]
+
+# Lattice-to-physical conversion factors.
+# dt_physical is the physical time per simulation timestep.
+dt_physical = u_max * nanovdb_voxel_size / u_max_physical
+nanovdb_velocity_scale = u_max_physical / u_max               # lattice vel -> m/s
+nanovdb_vorticity_scale = 1.0 / dt_physical                   # lattice vort -> 1/s
+nanovdb_q_criterion_scale = 1.0 / (dt_physical ** 2)          # lattice Q -> 1/s²
+
+# Align NanoVDB volumes with the original STL coordinate system.
+# The simulation flips X and Y when placing the car (R_y(180) + R_x(180)),
+# so we flip those axes back and compute min_world from the mesh shift to
+# undo the full transform chain (scale + rotate + translate).
+nanovdb_flip_axes = (True, True, False)
+Nx, Ny, Nz = grid_shape
+sx, sy, sz = mesh_shift
+cl = nanovdb_clip_lower
+cu = nanovdb_clip_upper
+vs = nanovdb_voxel_size
+nanovdb_min_world = (
+    (sx - Nx + 2 + cu[0]) * vs,  # x: flipped
+    (sy - Ny + 2 + cu[1]) * vs,  # y: flipped
+    (1 + cl[2] - sz) * vs,       # z: not flipped
+)
 
 plot_object_placement(
     vertices_wp,

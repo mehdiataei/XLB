@@ -3,6 +3,8 @@ from .utils import (
     save_image,
     save_fields_vtk,
     save_velocity_components_nvdb,
+    save_vorticity_nvdb,
+    save_q_criterion_nvdb,
     save_BCs_vtk,
     rotate_geometry,
     voxelize_stl,
