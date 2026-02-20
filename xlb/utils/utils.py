@@ -195,6 +195,7 @@ def save_velocity_components_nvdb(
         output_filename = os.path.join(output_dir, f"{prefix}_{component_name}_{timestep:07d}.nvdb")
         volume.save_to_nvdb(output_filename, codec=codec)
         del volume
+        wp.synchronize_device(device)
     print(f"Saved NanoVDB velocity components for timestep {timestep} to {output_dir}")
 
 
@@ -284,6 +285,8 @@ def save_vorticity_nvdb(
         vorticity_magnitude = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
         vorticity, vorticity_magnitude = vorticity_operator(u, bc_mask_dev, vorticity, vorticity_magnitude)
         vort_mag_np = vorticity_magnitude.numpy()[0]
+    del f_current_dev, bc_mask_dev, rho, u, vorticity, vorticity_magnitude
+    wp.synchronize_device(device)
     if flip_axes is not None:
         flip_dims = tuple(i for i, flip in enumerate(flip_axes) if flip)
         if flip_dims:
@@ -302,6 +305,7 @@ def save_vorticity_nvdb(
     output_filename = os.path.join(output_dir, f"{prefix}_magnitude_{timestep:07d}.nvdb")
     volume.save_to_nvdb(output_filename, codec=codec)
     del volume
+    wp.synchronize_device(device)
     print(f"Saved NanoVDB vorticity magnitude for timestep {timestep} to {output_dir}")
 
 
@@ -391,6 +395,8 @@ def save_q_criterion_nvdb(
         q_field = wp.zeros((1, *u.shape[1:]), dtype=wp.float32, device=device)
         norm_mu, q_field = q_criterion_operator(u, bc_mask_dev, norm_mu, q_field)
         q_np = q_field.numpy()[0]
+    del f_current_dev, bc_mask_dev, rho, u, norm_mu, q_field
+    wp.synchronize_device(device)
     if flip_axes is not None:
         flip_dims = tuple(i for i, flip in enumerate(flip_axes) if flip)
         if flip_dims:
@@ -409,6 +415,7 @@ def save_q_criterion_nvdb(
     output_filename = os.path.join(output_dir, f"{prefix}_{timestep:07d}.nvdb")
     volume.save_to_nvdb(output_filename, codec=codec)
     del volume
+    wp.synchronize_device(device)
     print(f"Saved NanoVDB Q-criterion for timestep {timestep} to {output_dir}")
 
 
