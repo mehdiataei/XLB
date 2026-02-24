@@ -342,6 +342,7 @@ def post_process(
     usd_stage,
     vorticity_operator,
     q_criterion_operator,
+    macro_jax,
     lag_forces=None,
     cd_values=None,
     reference_velocity=None,
@@ -353,11 +354,6 @@ def post_process(
     else:
         f_jax = f_current
 
-    macro_jax = Macroscopic(
-        compute_backend=ComputeBackend.JAX,
-        precision_policy=precision_policy,
-        velocity_set=xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=ComputeBackend.JAX),
-    )
     rho, u = macro_jax(f_jax)
     u = u[:, 1:-1, 1:-1, 1:-1]
 
@@ -464,16 +460,16 @@ def save_drag_coefficient(cd_values, filename):
         print(f"Could not create Cd plot: {e}")
 
 
-# grid_shape = (800, 400, 200)
+grid_shape = (800, 400, 250)
 # grid_shape = (1000, 500, 300)
-grid_shape = (256, 100, 70)
-u_max = 0.02
+# grid_shape = (256, 100, 70)
+u_max = 0.03
 u_max_physical = 30.0  # m/s, reference wind tunnel speed
 iter_per_flow_passes = grid_shape[0] / u_max
-num_steps = int(iter_per_flow_passes * 2.0)
+num_steps = 88000
 post_process_interval = 200
 print_interval = 100
-wheel_rotation_speed = -0.006
+wheel_rotation_speed = -0.002
 num_wheels = 4
 save_velocity_nanovdb = True
 save_vorticity_nanovdb = True
@@ -602,6 +598,12 @@ with wp.ScopedDevice(device):
         compute_backend=compute_backend,
     )
 
+macro_jax = Macroscopic(
+    compute_backend=ComputeBackend.JAX,
+    precision_policy=precision_policy,
+    velocity_set=xlb.velocity_set.D3Q27(precision_policy=precision_policy, compute_backend=ComputeBackend.JAX),
+)
+
 velocities_wp = wp.zeros(shape=vertices_wp.shape[0], dtype=wp.vec3)
 
 try:
@@ -649,6 +651,7 @@ try:
                 usd_stage,
                 vorticity_operator,
                 q_criterion_operator,
+                macro_jax,
                 lag_forces=lag_forces,
                 cd_values=cd_values,
                 reference_velocity=u_max,
